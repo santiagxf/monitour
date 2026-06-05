@@ -1,0 +1,22 @@
+{
+  "input_model": {
+    "type": "OnnxModel",
+    "config": {
+      "model_path": "6drepnet.fp32.onnx"
+    }
+  },
+  "passes": {
+    "fp16": {
+      "type": "OnnxFloatToFloat16",
+      "config": {
+        "keep_io_types": true
+      }
+    }
+  },
+  "engine": {
+    "evaluate_input_model": false,
+    "output_dir": ".",
+    "output_name": "6drepnet.fp16",
+    "cache_dir": ".olive_cache"
+  }
+}
