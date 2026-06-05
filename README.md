@@ -4,7 +4,7 @@ Windows tray utility that watches your face via the webcam, infers which monitor
 
 Native C++23 / C++/WinRT, Windows-only.
 
-Settings and calibration are persisted to disk on write but not yet re-read on startup — every launch begins with defaults.
+The app starts in passive mode until it learns your setup with enough confidence. Settings and calibration are persisted to disk on write but not yet re-read on startup — every launch begins with defaults.
 
 Target latency: <20 ms median (NPU), <40 ms p99. Dwell delay 250 ms.
 
