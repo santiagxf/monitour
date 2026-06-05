@@ -31,4 +31,5 @@ ctest --preset x64-release      # or run build\x64-release\tests\Monitour_tests.
 
 - The pipeline is wired end-to-end but key pieces are intentionally stubbed (notably `HeadPoseModel::evaluate`, the face detector, and the JSON load paths). Each is marked `TODO` in code — don't mistake a stub for a bug.
 - Persisted `HMONITOR` values are **not stable across launches**; re-key by monitor device rect / `szDevice`, not the raw handle.
-- This is real-time, latency-sensitive code. Avoid allocations and locking on the capture/inference hot path; prefer the existing single-slot `FrameSlot` pattern.
+- This is real-time, latency-sensitive code. Current target: **<20 ms median (NPU), <40 ms p99**, plus a 250 ms dwell delay (see README.md). Avoid allocations and locking on the capture/inference hot path; prefer the existing single-slot `FrameSlot` pattern.
+- **Whenever a change affects the pipeline's latency profile** (e.g. adds work to capture/preprocess/inference/focus, changes the inference path, alters the dwell delay, or measurably shifts the budget), update the latency target in [README.md](README.md) — and here if the numbers in this section change — in the same commit. Don't let the documented target drift from reality.
