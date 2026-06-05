@@ -2,7 +2,7 @@
 
 Windows tray utility that watches your face via the webcam, infers which monitor you're looking at, and moves foreground focus to the most-recently-used window on that screen.
 
-Native C++23 / C++/WinRT, Windows-only. **Scaffolding stage** — pipeline is wired end-to-end, but the head-pose model, face detector, and JSON load paths are stubbed (see `HANDOFF.md`).
+Native C++23 / C++/WinRT, Windows-only. **Scaffolding stage** — pipeline is wired end-to-end, but the head-pose model, face detector, and JSON load paths are stubbed.
 
 ## Build
 
