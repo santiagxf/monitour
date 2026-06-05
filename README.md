@@ -1,6 +1,6 @@
 # Monitour
 
-Windows tray utility that watches your face via the webcam, infers which monitor you're looking at, and moves foreground focus to the most-recently-used window on that screen.
+Windows utility that watches your face via the webcam, infers which monitor you're looking at, and moves foreground focus to the most-recently-used window on that screen.
 
 Native C++23 / C++/WinRT, Windows-only.
 
@@ -8,7 +8,11 @@ The app starts in passive mode until it learns your setup with enough confidence
 
 Target latency: <20 ms median (NPU), <40 ms p99. Dwell delay 250 ms.
 
-## How it learns your setup
+## Motivation
+
+Do you find yourself having an agent working on one screen while doing something else on a different one? When the agent needs help, does switching to the terminal where the agent is running, type something, and then switching back result annoying? This app makes `yawing = alt + tab`. It's design to minimize disrumption and to run to the point it feels natural. It self-adjust and only actives when it got your setting. 
+
+## How it learns
 
 There is no calibration wizard. The app learns where each monitor sits in your head-pose space by watching what you actually do.
 
