@@ -2,7 +2,9 @@
 
 Windows tray utility that watches your face via the webcam, infers which monitor you're looking at, and moves foreground focus to the most-recently-used window on that screen.
 
-Native C++23 / C++/WinRT, Windows-only. **Scaffolding stage** — pipeline is wired end-to-end, but the head-pose model, face detector, and JSON load paths are stubbed.
+Native C++23 / C++/WinRT, Windows-only.
+
+**Status: not functional yet.** The app builds, the tray icon appears, and the camera opens, but focus does not actually follow your gaze. The head-pose model, the face detector, and reading settings/calibration back from disk are still placeholders.
 
 Target latency: <20 ms median (NPU), <40 ms p99. Dwell delay 250 ms.
 
