@@ -16,6 +16,7 @@ constexpr UINT WM_SET_PROGRESS = WM_APP + 3;
 constexpr UINT IDM_TOGGLE  = 1001;
 constexpr UINT IDM_EXIT    = 1002;
 constexpr UINT IDM_DEBUG_STATS = 1003;
+constexpr UINT IDM_FOCUS_GLOW  = 1004;
 constexpr UINT TRAY_UID    = 0xC0DE;
 constexpr wchar_t kClass[] = L"MonitourTrayMessageWindow";
 
@@ -187,7 +188,8 @@ void TrayIcon::applyStatus(Status s) {
     Shell_NotifyIconW(NIM_MODIFY, &nid_);
     if (becameActive) {
         // Audible cue that learning is complete and focus-following is live.
-        PlaySoundW(L"SystemAsterisk", nullptr, SND_ALIAS | SND_ASYNC);
+        PlaySoundW(L"C:\\Windows\\Media\\Windows Proximity Connection.wav",
+                   nullptr, SND_FILENAME | SND_ASYNC | SND_NODEFAULT);
         log::info(L"Tray: entered ACTIVE mode");
     }
 }
@@ -219,6 +221,9 @@ LRESULT TrayIcon::handle(UINT msg, WPARAM wParam, LPARAM lParam) {
                 case IDM_DEBUG_STATS:
                     if (cb_.onToggleDebugStats) cb_.onToggleDebugStats();
                     return 0;
+                case IDM_FOCUS_GLOW:
+                    if (cb_.onToggleFocusGlow) cb_.onToggleFocusGlow();
+                    return 0;
                 case IDM_EXIT:
                     if (cb_.onQuit) cb_.onQuit();
                     return 0;
@@ -246,6 +251,11 @@ void TrayIcon::showContextMenu(POINT pt) {
         const bool visible = cb_.isDebugStatsVisible && cb_.isDebugStatsVisible();
         AppendMenuW(menu, MF_STRING | (visible ? MF_CHECKED : MF_UNCHECKED),
                     IDM_DEBUG_STATS, L"Show debug stats");
+    }
+    if (cb_.onToggleFocusGlow) {
+        const bool on = cb_.isFocusGlowEnabled && cb_.isFocusGlowEnabled();
+        AppendMenuW(menu, MF_STRING | (on ? MF_CHECKED : MF_UNCHECKED),
+                    IDM_FOCUS_GLOW, L"Focus glow");
     }
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, IDM_EXIT, L"Exit");
