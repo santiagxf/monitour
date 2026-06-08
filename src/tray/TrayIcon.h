@@ -33,7 +33,9 @@ public:
 
     // Passive: still learning which monitor the user faces (yellow dot).
     // Active:  calibrated and switching focus (green dot).
-    enum class Status { Passive, Active };
+    // Absent:  no face in the webcam — learning and switching are paused
+    //          (gray dot). Returns to Passive/Active when the user is back.
+    enum class Status { Passive, Active, Absent };
 
     TrayIcon();
     ~TrayIcon();
@@ -73,6 +75,7 @@ private:
     std::wstring progressDetail_;
     HICON      iconPassive_{nullptr};
     HICON      iconActive_{nullptr};
+    HICON      iconAbsent_{nullptr};
 };
 
 }  // namespace monitour::tray
