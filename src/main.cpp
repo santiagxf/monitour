@@ -281,6 +281,10 @@ static int wmain_inner() {
         auto lastTargetSince = std::chrono::steady_clock::now();
         HMONITOR lastFlashed = nullptr;  // suppresses re-flash on stable target
         bool wasActive = false;
+        // Face-absence overrides the visible tray status to Absent (gray).
+        // On return, we re-post the underlying Passive/Active — and the
+        // existing Active sound fires on the Absent→Active edge for free.
+        bool wasAbsent = false;
         int lastPct = -1;
         uint64_t lastInputSeq = 0;
 
@@ -462,7 +466,21 @@ static int wmain_inner() {
             const bool active = progress.mature;
             const int pct = static_cast<int>(progress.overall * 100.0 + 0.5);
             const wchar_t* reason = active ? nullptr : stuckReason(progress);
-            if (active != wasActive) {
+            // Face presence overrides the visible tray status. While the user
+            // is away the dot turns gray; on return we re-post the underlying
+            // Passive/Active — and the existing "entered ACTIVE" sound fires
+            // for free on an Absent→Active return.
+            const bool faceAbsent = faceDetReady && !faceValid;
+            if (faceAbsent != wasAbsent) {
+                wasAbsent = faceAbsent;
+                if (faceAbsent) {
+                    tray.postStatus(tray::TrayIcon::Status::Absent);
+                } else {
+                    tray.postStatus(active ? tray::TrayIcon::Status::Active
+                                           : tray::TrayIcon::Status::Passive);
+                    wasActive = active;
+                }
+            } else if (!faceAbsent && active != wasActive) {
                 wasActive = active;
                 tray.postStatus(active ? tray::TrayIcon::Status::Active
                                        : tray::TrayIcon::Status::Passive);

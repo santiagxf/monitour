@@ -104,8 +104,9 @@ bool TrayIcon::create(HINSTANCE hInstance, Callbacks cb) {
     nid_.uID    = TRAY_UID;
     nid_.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid_.uCallbackMessage = WM_TRAYICON;
-    iconPassive_ = makeDotIcon(240, 200, 0);   // yellow: learning
-    iconActive_  = makeDotIcon(40, 200, 80);    // green: active
+    iconPassive_ = makeDotIcon(240, 200, 0);    // yellow: learning
+    iconActive_  = makeDotIcon(40, 200, 80);     // green: active
+    iconAbsent_  = makeDotIcon(150, 150, 150);   // gray: face not detected
     nid_.hIcon  = iconPassive_ ? iconPassive_ : LoadIconW(nullptr, IDI_APPLICATION);
     updateTip();
     Shell_NotifyIconW(NIM_ADD, &nid_);
@@ -120,6 +121,7 @@ void TrayIcon::destroy() {
     }
     if (iconPassive_) { DestroyIcon(iconPassive_); iconPassive_ = nullptr; }
     if (iconActive_)  { DestroyIcon(iconActive_);  iconActive_  = nullptr; }
+    if (iconAbsent_)  { DestroyIcon(iconAbsent_);  iconAbsent_  = nullptr; }
 }
 
 void TrayIcon::updateTip() {
@@ -127,6 +129,8 @@ void TrayIcon::updateTip() {
     wchar_t buf[128];
     if (paused) {
         wcscpy_s(buf, L"Monitour (paused)");
+    } else if (status_ == Status::Absent) {
+        wcscpy_s(buf, L"Monitour (waiting for you…)");
     } else if (status_ == Status::Active) {
         wcscpy_s(buf, L"Monitour (active)");
     } else {
@@ -182,7 +186,9 @@ void TrayIcon::applyStatus(Status s) {
     if (!hwnd_) return;
     const bool becameActive = (s == Status::Active && status_ != Status::Active);
     status_ = s;
-    HICON icon = (s == Status::Active) ? iconActive_ : iconPassive_;
+    HICON icon = (s == Status::Active) ? iconActive_
+               : (s == Status::Absent) ? iconAbsent_
+                                       : iconPassive_;
     if (icon) nid_.hIcon = icon;
     updateTip();
     Shell_NotifyIconW(NIM_MODIFY, &nid_);
