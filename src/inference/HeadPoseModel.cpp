@@ -1,11 +1,10 @@
 #include "HeadPoseModel.h"
 
-#include <winrt/Windows.Storage.h>
-#include <winrt/Windows.Foundation.Collections.h>
-
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
-#include <vector>
+#include <limits>
 
 #include "d3d/D3DContext.h"
 #include "util/ComUtil.h"
@@ -13,62 +12,17 @@
 
 namespace monitour::inference {
 
-using namespace winrt::Windows::AI::MachineLearning;
-using namespace winrt::Windows::Foundation;
-using namespace winrt::Windows::Foundation::Collections;
-using namespace winrt::Windows::Storage;
-
-HeadPoseModel::HeadPoseModel(d3d::D3DContext& d3d,
-                             const std::filesystem::path& modelPath,
-                             DeviceSelection device,
-                             UINT inputSize)
-    : d3d_{d3d}, device_{std::move(device)}, inputSize_{inputSize} {
-    auto file = StorageFile::GetFileFromPathAsync(modelPath.wstring()).get();
-    model_ = LearningModel::LoadFromStorageFileAsync(file).get();
-    log::info(L"HeadPoseModel: loaded {} ({} input features, {} output features)",
-              modelPath.wstring(),
-              static_cast<unsigned>(model_.InputFeatures().Size()),
-              static_cast<unsigned>(model_.OutputFeatures().Size()));
-
-    if (model_.InputFeatures().Size() > 0) {
-        inputName_ = std::wstring{model_.InputFeatures().GetAt(0).Name()};
-    } else {
-        inputName_ = L"input";
-    }
-    if (model_.OutputFeatures().Size() > 0) {
-        outputName_ = std::wstring{model_.OutputFeatures().GetAt(0).Name()};
-    } else {
-        outputName_ = L"output";
-    }
-
-    LearningModelSessionOptions opts{};
-    // Batch fixed at 1 so the runtime can pre-plan.
-    opts.BatchSizeOverride(1);
-    session_ = LearningModelSession{model_, device_.device, opts};
-    binding_ = LearningModelBinding{session_};
-
-    // Staging buffer for CPU readback of the preprocessed tensor. The compute
-    // shader writes a structured buffer of min16float backed by 32-bit slots
-    // (4 bytes/element), so mirror that byte size exactly.
-    const UINT elements = 3u * inputSize_ * inputSize_;
-    D3D11_BUFFER_DESC sd{};
-    sd.ByteWidth      = elements * sizeof(uint32_t);
-    sd.Usage          = D3D11_USAGE_STAGING;
-    sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    MONITOUR_CHECK_HR(d3d_.device()->CreateBuffer(&sd, nullptr, staging_.put()));
-    inputData_.resize(elements);
-}
-
-HeadPoseModel::~HeadPoseModel() = default;
-
 namespace {
 
-// 6DRepNet returns a 3x3 rotation matrix; decode it to Euler angles using the
-// same convention as the upstream compute_euler_angles_from_rotation_matrices
-// (Tait–Bryan, x=pitch, y=yaw, z=roll), then convert to degrees.
+std::wstring toWide(std::string_view s) {
+    return std::wstring(s.begin(), s.end());
+}
+
+// 6DRepNet outputs a 3x3 rotation matrix. Decode to Tait-Bryan Euler angles
+// (x=pitch, y=yaw, z=roll), matching upstream
+// compute_euler_angles_from_rotation_matrices, then to degrees.
 void decodeEuler(const float R[9], float& yawDeg, float& pitchDeg,
                  float& rollDeg) {
-    // Row-major: R[3*r + c].
     const float r00 = R[0], r10 = R[3], r20 = R[6];
     const float r21 = R[7], r22 = R[8];
 
@@ -81,7 +35,6 @@ void decodeEuler(const float R[9], float& yawDeg, float& pitchDeg,
         yaw   = std::atan2(-r20, sy);
         roll  = std::atan2(r10, r00);
     } else {
-        // Gimbal lock: roll is undefined; fold it into pitch.
         pitch = std::atan2(-r21, r22);
         yaw   = std::atan2(-r20, sy);
         roll  = 0.0f;
@@ -93,70 +46,124 @@ void decodeEuler(const float R[9], float& yawDeg, float& pitchDeg,
 
 }  // namespace
 
+HeadPoseModel::HeadPoseModel(d3d::D3DContext& d3d,
+                             const std::filesystem::path& modelPath,
+                             DeviceChoice choice,
+                             const std::filesystem::path& cacheDir,
+                             UINT inputSize)
+    : d3d_{d3d}, inputSize_{inputSize} {
+    auto plan = makeSessionPlan(choice, cacheDir);
+    resolved_ = plan.resolved;
+
+    session_ = std::make_unique<Ort::Session>(
+        ortEnv(), modelPath.wstring().c_str(), *plan.options);
+
+    Ort::AllocatorWithDefaultOptions alloc;
+    inputName_  = std::string{session_->GetInputNameAllocated(0, alloc).get()};
+    outputName_ = std::string{session_->GetOutputNameAllocated(0, alloc).get()};
+
+    log::info(L"HeadPoseModel: loaded {} (in='{}', out='{}')",
+              modelPath.wstring(), toWide(inputName_), toWide(outputName_));
+    log::info(L"HeadPoseModel: running on {} on {} ({})",
+              resolved_.epName, resolved_.deviceType, resolved_.vendor);
+
+    // CPU staging mirror of the preprocessor output. The shader writes
+    // RWStructuredBuffer<min16float> with a 4-byte stride (fxc without
+    // native 16-bit types backs min16float in a full float32 slot), so each
+    // element is a plain float32. Mirror that byte size.
+    const UINT elements = 3u * inputSize_ * inputSize_;
+    D3D11_BUFFER_DESC sd{};
+    sd.ByteWidth      = elements * sizeof(uint32_t);
+    sd.Usage          = D3D11_USAGE_STAGING;
+    sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    MONITOUR_CHECK_HR(d3d_.device()->CreateBuffer(&sd, nullptr, staging_.put()));
+    inputData_.resize(elements);
+}
+
+HeadPoseModel::~HeadPoseModel() = default;
+
 HeadPose HeadPoseModel::evaluate(ID3D11Buffer* preprocessed) {
     HeadPose pose{};
-    if (!preprocessed) return pose;
+    if (!preprocessed || !session_) return pose;
 
     auto* ctx = d3d_.context();
     const UINT elements = 3u * inputSize_ * inputSize_;
 
-    // 1. Copy the GPU tensor into the CPU-readable staging buffer and map it.
-    //    (Runs on the inference worker thread, same thread as the preprocessor
-    //    Dispatch, so the immediate context is used single-threaded.)
+    // 1. Copy GPU tensor → CPU staging, map, read float32 directly.
+    //    Zero-copy via the OpenVINO Remote Tensor API is a follow-up; for
+    //    now the readback cost is dwarfed by face detection + inference.
     ctx->CopyResource(staging_.get(), preprocessed);
-
     D3D11_MAPPED_SUBRESOURCE mapped{};
     if (FAILED(ctx->Map(staging_.get(), 0, D3D11_MAP_READ, 0, &mapped))) {
         log::warn(L"HeadPoseModel: staging Map failed.");
         return pose;
     }
-    // The shader writes RWStructuredBuffer<min16float> with a 4-byte stride.
-    // Compiled by fxc without native 16-bit types, min16float is stored as a
-    // full 32-bit float, so each slot is a plain float32 — read it directly
-    // (this also matches the exported ONNX graph's tensor(float) input).
     std::memcpy(inputData_.data(), mapped.pData, elements * sizeof(float));
     ctx->Unmap(staging_.get(), 0);
 
-    // 2. Bind the float32 [1,3,H,W] input and run synchronous inference.
+    // 2. Build the input tensor, run inference, decode the rotation matrix.
     try {
-        const std::vector<int64_t> shape{
+        const std::array<int64_t, 4> shape{
             1, 3, static_cast<int64_t>(inputSize_),
             static_cast<int64_t>(inputSize_)};
-        auto input = TensorFloat::CreateFromArray(shape, inputData_);
+        Ort::MemoryInfo memInfo = Ort::MemoryInfo::CreateCpu(
+            OrtArenaAllocator, OrtMemTypeDefault);
+        Ort::Value input = Ort::Value::CreateTensor<float>(
+            memInfo, inputData_.data(), inputData_.size(),
+            shape.data(), shape.size());
 
-        binding_.Clear();
-        binding_.Bind(inputName_, input);
+        const char* inputNames[]  = {inputName_.c_str()};
+        const char* outputNames[] = {outputName_.c_str()};
 
-        auto results = session_.Evaluate(binding_, L"");
-        auto out = results.Outputs().Lookup(outputName_).try_as<TensorFloat>();
-        if (!out) {
-            log::warn(L"HeadPoseModel: output is not a float tensor.");
+        auto outputs = session_->Run(Ort::RunOptions{nullptr},
+                                     inputNames, &input, 1,
+                                     outputNames, 1);
+        if (outputs.empty()) {
+            log::warn(L"HeadPoseModel: empty Run output.");
             return pose;
         }
-
-        auto view = out.GetAsVectorView();
-        if (view.Size() < 9) {
-            log::warn(L"HeadPoseModel: unexpected output size {}.", view.Size());
+        const float* R = outputs[0].GetTensorData<float>();
+        auto info = outputs[0].GetTensorTypeAndShapeInfo();
+        if (info.GetElementCount() < 9) {
+            log::warn(L"HeadPoseModel: unexpected output element count {}.",
+                      info.GetElementCount());
             return pose;
         }
-
-        float R[9];
-        for (uint32_t i = 0; i < 9; ++i) R[i] = view.GetAt(i);
         decodeEuler(R, pose.yaw, pose.pitch, pose.roll);
 
-        // No face detector yet, so we can't score "is a face present". Assume
-        // the user is at the camera and report full confidence; replace this
-        // with the detector's score once it lands (see HANDOFF.md). Reject
-        // implausible poses (NaN / wildly out of range) as low confidence.
+        // Plausibility gate (no face-detector score plumbed in here):
+        // NaN / out-of-range angles report zero confidence so the
+        // calibrator ignores them.
         const bool plausible = std::isfinite(pose.yaw) &&
                                std::isfinite(pose.pitch) &&
-                               std::abs(pose.yaw) <= 90.0f &&
+                               std::abs(pose.yaw)   <= 90.0f &&
                                std::abs(pose.pitch) <= 90.0f;
         pose.confidence = plausible ? 1.0f : 0.0f;
-    } catch (winrt::hresult_error const& e) {
-        log::warn(L"HeadPoseModel: Evaluate failed: {}",
-                  std::wstring{e.message()});
+    } catch (Ort::Exception const& e) {
+        log::warn(L"HeadPoseModel: Run failed: {}", toWide(e.what()));
         pose.confidence = 0.0f;
+    }
+
+    // Periodic pose-distribution diagnostic. If the model is reliably
+    // crashing the plausibility gate, that's why focus-switching never
+    // arms — even with a face crop.
+    ++evalCount_;
+    if (pose.confidence > 0.f) {
+        ++plausibleCount_;
+        yawMin_   = std::min(yawMin_, pose.yaw);
+        yawMax_   = std::max(yawMax_, pose.yaw);
+        pitchMin_ = std::min(pitchMin_, pose.pitch);
+        pitchMax_ = std::max(pitchMax_, pose.pitch);
+    }
+    if (evalCount_ % 50 == 0) {
+        log::info(L"HeadPose: {} evals, {} plausible "
+                  L"(yaw {:.1f}..{:.1f}, pitch {:.1f}..{:.1f}); last "
+                  L"yaw={:.1f} pitch={:.1f} roll={:.1f} conf={:.2f}",
+                  evalCount_, plausibleCount_,
+                  yawMin_, yawMax_, pitchMin_, pitchMax_,
+                  pose.yaw, pose.pitch, pose.roll, pose.confidence);
+        yawMin_ = pitchMin_ = std::numeric_limits<float>::infinity();
+        yawMax_ = pitchMax_ = -std::numeric_limits<float>::infinity();
     }
     return pose;
 }

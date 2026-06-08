@@ -27,9 +27,13 @@ The model is persisted to `calibration.json` and a tray UI surfaces a 0–1 matu
 
 ## Build
 
-From a **Developer PowerShell for VS 2022**:
+Requires **Windows 11 24H2** or newer (NPU execution providers ship in that build). Build from a **Developer PowerShell for VS 2022** with `nuget.exe` on `PATH`:
 
 ```powershell
+$id = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property instanceId
+Import-Module "${env:ProgramFiles}\Microsoft Visual Studio\2022\Community\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
+Enter-VsDevShell -InstanceId $id -SkipAutomaticLocation -DevCmdArguments "-arch=x64"
+
 cmake --preset x64-release
 cmake --build --preset x64-release
 ```
@@ -46,7 +50,8 @@ Not in the repo. See `models/README.md` for export steps.
 
 - Settings: `%LOCALAPPDATA%\Monitour\settings.json`
 - Calibration: `%LOCALAPPDATA%\Monitour\calibration.json`
-- Logs (debug): `%LOCALAPPDATA%\Monitour\monitour.log`
+- Logs: `%LOCALAPPDATA%\Monitour\monitour.log`
+- NPU compile cache: `%LOCALAPPDATA%\Monitour\ov_cache\` (delete this if you replace the model file)
 
 ## Hotkeys
 

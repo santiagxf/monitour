@@ -5,7 +5,9 @@ out/
 *.user
 *.suo
 *.cso
-models/*.onnx
+models/*
 !models/.gitkeep
+!models/README.md
+*.onnx
 *.log
 %LOCALAPPDATA%/

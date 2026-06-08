@@ -1,35 +1,46 @@
 #pragma once
 #include <filesystem>
+#include <memory>
 #include <string>
 
-#include <winrt/Windows.AI.MachineLearning.h>
+#include <onnxruntime_cxx_api.h>
 
 namespace monitour::inference {
 
 enum class DeviceChoice {
-    Auto,        // NPU → DirectX → CPU
-    ForceNpu,
-    ForceDirectX,
-    ForceCpu,
+    Auto,        // prefer NPU; fall back to GPU then CPU
+    ForceNpu,    // diagnostic: throw if no NPU EP is registered
+    ForceGpu,    // diagnostic: pin to GPU
+    ForceCpu,    // diagnostic: pin to CPU
 };
 
-struct DeviceSelection {
-    winrt::Windows::AI::MachineLearning::LearningModelDevice device{nullptr};
-    winrt::Windows::AI::MachineLearning::LearningModelDeviceKind kind{
-        winrt::Windows::AI::MachineLearning::LearningModelDeviceKind::Default};
-    std::wstring description;
-    bool isNpu{false};
+// What the runtime actually resolved to *before* the session is built. We
+// trust the explicitly-selected EpDevice, not a wished-for policy.
+struct ResolvedDevice {
+    std::wstring epName;       // e.g. "OpenVINOExecutionProvider"
+    std::wstring deviceType;   // "NPU" | "GPU" | "CPU"
+    std::wstring vendor;       // "Intel" | "Microsoft" | "AMD" | ...
+    bool onNpu{false};
 };
 
-// Picks the best available LearningModelDevice per DeviceChoice. Logs the
-// chosen device once so we can verify in the field.
-DeviceSelection selectDevice(DeviceChoice choice);
+// Shared process-wide ORT environment. Created on first call, destroyed at
+// process exit. The Windows ML EP catalog is bound to this env.
+Ort::Env& ortEnv();
 
-// Path to the model variant best matched to the selected device:
-//   NPU      → 6drepnet.int8.onnx
-//   DirectX  → 6drepnet.fp16.onnx
-//   CPU      → 6drepnet.fp16.onnx (acceptable for diagnostics only)
-std::filesystem::path modelPathFor(const DeviceSelection& sel,
-                                   const std::filesystem::path& modelDir);
+// Pick the best EpDevice for `choice` and build a SessionOptions that
+// targets it. Sets the OpenVINO cache_dir provider option so first-run NPU
+// compile is amortized across launches. Logs the chosen device. Throws
+// std::runtime_error if no acceptable device is found.
+struct SessionPlan {
+    std::unique_ptr<Ort::SessionOptions> options;
+    ResolvedDevice resolved;
+};
+SessionPlan makeSessionPlan(DeviceChoice choice,
+                            const std::filesystem::path& cacheDir);
+
+// Path to the model variant for the target device. Today this is always the
+// FP16 model — the NPU runs FP16 natively and INT8 needs per-machine
+// activation calibration that isn't worth the deployment hazard.
+std::filesystem::path modelPathFor(const std::filesystem::path& modelDir);
 
 }  // namespace monitour::inference

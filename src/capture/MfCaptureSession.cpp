@@ -141,26 +141,62 @@ HRESULT STDMETHODCALLTYPE MfCaptureSession::OnReadSample(
     LONGLONG timestamp, IMFSample* sample) noexcept {
     if (!running_.load(std::memory_order_acquire)) return S_OK;
 
+    ++callbackCount_;
+    const auto bump = [this](DropReason r) {
+        ++drops_[static_cast<size_t>(r)];
+    };
+
     if (FAILED(hrStatus)) {
         log::error(L"OnReadSample HRESULT 0x{:x}", static_cast<unsigned>(hrStatus));
-    } else if (sample) {
+        bump(DropReason::HrStatusFailed);
+    } else if (!sample) {
+        bump(DropReason::NullSample);
+    } else {
         winrt::com_ptr<IMFMediaBuffer> buffer;
-        if (SUCCEEDED(sample->ConvertToContiguousBuffer(buffer.put()))) {
+        HRESULT hrCvt = sample->ConvertToContiguousBuffer(buffer.put());
+        if (FAILED(hrCvt)) {
+            bump(DropReason::ConvertToContiguousFailed);
+        } else {
             winrt::com_ptr<IMFDXGIBuffer> dxgi;
-            if (SUCCEEDED(buffer->QueryInterface(IID_PPV_ARGS(dxgi.put())))) {
+            HRESULT hrQi = buffer->QueryInterface(IID_PPV_ARGS(dxgi.put()));
+            if (FAILED(hrQi)) {
+                bump(DropReason::NoDxgiBuffer);
+            } else {
                 winrt::com_ptr<ID3D11Texture2D> tex;
                 UINT subres = 0;
-                if (SUCCEEDED(dxgi->GetResource(IID_PPV_ARGS(tex.put()))) &&
-                    SUCCEEDED(dxgi->GetSubresourceIndex(&subres))) {
+                HRESULT hrTex = dxgi->GetResource(IID_PPV_ARGS(tex.put()));
+                HRESULT hrIdx = dxgi->GetSubresourceIndex(&subres);
+                if (FAILED(hrTex) || FAILED(hrIdx)) {
+                    bump(DropReason::DxgiResourceFailed);
+                } else {
                     Frame f;
                     f.texture = tex;
                     f.subresource = subres;
                     f.captureQpc = timestamp;
                     f.seq = seq_.fetch_add(1, std::memory_order_relaxed) + 1;
                     slot_.publish(std::move(f));
+                    ++published_;
+                    if (published_ == 1) {
+                        log::info(L"Capture: first frame published "
+                                  L"(seq=1, subresource={}).",
+                                  static_cast<unsigned>(subres));
+                    }
                 }
             }
         }
+    }
+
+    // Heartbeat every ~120 callbacks (~4s at 30fps). Tells us at a glance if
+    // frames are flowing and where they're being dropped.
+    if (callbackCount_ % 120 == 0) {
+        log::info(L"Capture stats: callbacks={} published={} | drops "
+                  L"nullSample={} hr={} convert={} noDxgi={} dxgiRes={}",
+                  callbackCount_, published_,
+                  drops_[static_cast<size_t>(DropReason::NullSample)],
+                  drops_[static_cast<size_t>(DropReason::HrStatusFailed)],
+                  drops_[static_cast<size_t>(DropReason::ConvertToContiguousFailed)],
+                  drops_[static_cast<size_t>(DropReason::NoDxgiBuffer)],
+                  drops_[static_cast<size_t>(DropReason::DxgiResourceFailed)]);
     }
 
     if (streamFlags & MF_SOURCE_READERF_ENDOFSTREAM) {

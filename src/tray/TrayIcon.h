@@ -22,6 +22,10 @@ public:
         std::function<void()> onTogglePause;
         std::function<void()> onQuit;
         std::function<bool()> isPaused;
+        // Optional: when set, a checkable "Show debug stats" item appears in
+        // the context menu. isDebugStatsVisible reports the current state.
+        std::function<void()> onToggleDebugStats;
+        std::function<bool()> isDebugStatsVisible;
     };
 
     // Passive: still learning which monitor the user faces (yellow dot).
