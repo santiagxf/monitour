@@ -38,12 +38,36 @@ public:
                                UINT subresource);
 
 private:
+    // Per-attempt outcomes — counters surface in the periodic FaceDetect log.
+    enum class Outcome {
+        Success,
+        NoFaceFound,
+        ZeroAreaFace,
+        DetectThrew,
+        MapFailed,
+        StagingCreateFailed,
+        NoDetector,
+        NullTexture,
+        ZeroSizeFrame,
+        Count
+    };
+    void maybeFlushDiagnostics();
+
     winrt::Windows::Media::FaceAnalysis::FaceDetector detector_{nullptr};
 
     // Reused luma staging texture (lazily (re)created to match the frame).
     winrt::com_ptr<ID3D11Texture2D> staging_;
     UINT stagingW_{0};
     UINT stagingH_{0};
+
+    // Diagnostics — flushed every kFlushEvery attempts.
+    uint64_t attempts_{0};
+    uint64_t outcomes_[static_cast<size_t>(Outcome::Count)] = {};
+    uint64_t faceCandidates_{0};
+    uint64_t lumaMeanSum_{0};
+    uint64_t lumaSamples_{0};
+    uint8_t  lumaMin_{255};
+    uint8_t  lumaMax_{0};
 };
 
 }  // namespace monitour::inference

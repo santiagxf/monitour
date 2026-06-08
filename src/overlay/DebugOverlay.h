@@ -45,6 +45,10 @@ public:
     bool create(HINSTANCE hinst);
     void destroy();
 
+    // Show/hide the window. Call from the UI thread.
+    void setVisible(bool visible);
+    bool isVisible() const noexcept;
+
     // Thread-safe: snapshot the stats and request a repaint.
     void update(const Stats& s);
 

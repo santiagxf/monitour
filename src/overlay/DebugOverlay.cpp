@@ -57,8 +57,17 @@ bool DebugOverlay::create(HINSTANCE hinst) {
 
     SetLayeredWindowAttributes(hwnd_, 0, kAlpha, LWA_ALPHA);
     recomposeAndResize();
-    ShowWindow(hwnd_, SW_SHOWNOACTIVATE);
+    // Hidden by default; the user reveals it from the tray menu.
     return true;
+}
+
+void DebugOverlay::setVisible(bool visible) {
+    if (!hwnd_) return;
+    ShowWindow(hwnd_, visible ? SW_SHOWNOACTIVATE : SW_HIDE);
+}
+
+bool DebugOverlay::isVisible() const noexcept {
+    return hwnd_ && IsWindowVisible(hwnd_);
 }
 
 void DebugOverlay::destroy() {

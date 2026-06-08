@@ -15,6 +15,7 @@ constexpr UINT WM_SET_STATUS = WM_APP + 2;
 constexpr UINT WM_SET_PROGRESS = WM_APP + 3;
 constexpr UINT IDM_TOGGLE  = 1001;
 constexpr UINT IDM_EXIT    = 1002;
+constexpr UINT IDM_DEBUG_STATS = 1003;
 constexpr UINT TRAY_UID    = 0xC0DE;
 constexpr wchar_t kClass[] = L"MonitourTrayMessageWindow";
 
@@ -215,6 +216,9 @@ LRESULT TrayIcon::handle(UINT msg, WPARAM wParam, LPARAM lParam) {
                     if (cb_.onTogglePause) cb_.onTogglePause();
                     refresh();
                     return 0;
+                case IDM_DEBUG_STATS:
+                    if (cb_.onToggleDebugStats) cb_.onToggleDebugStats();
+                    return 0;
                 case IDM_EXIT:
                     if (cb_.onQuit) cb_.onQuit();
                     return 0;
@@ -238,6 +242,11 @@ void TrayIcon::showContextMenu(POINT pt) {
     HMENU menu = CreatePopupMenu();
     bool paused = cb_.isPaused && cb_.isPaused();
     AppendMenuW(menu, MF_STRING, IDM_TOGGLE, paused ? L"Resume" : L"Pause");
+    if (cb_.onToggleDebugStats) {
+        const bool visible = cb_.isDebugStatsVisible && cb_.isDebugStatsVisible();
+        AppendMenuW(menu, MF_STRING | (visible ? MF_CHECKED : MF_UNCHECKED),
+                    IDM_DEBUG_STATS, L"Show debug stats");
+    }
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, IDM_EXIT, L"Exit");
     SetForegroundWindow(hwnd_);

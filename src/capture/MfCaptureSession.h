@@ -66,6 +66,19 @@ private:
     std::atomic<bool>    running_{false};
     std::atomic<DWORD>   delayMs_{0};
     std::atomic<uint64_t> seq_{0};
+
+    // Diagnostics (touched only from OnReadSample, which serializes via MF).
+    enum class DropReason {
+        HrStatusFailed,
+        NullSample,
+        ConvertToContiguousFailed,
+        NoDxgiBuffer,
+        DxgiResourceFailed,
+        Count
+    };
+    uint64_t callbackCount_{0};
+    uint64_t published_{0};
+    uint64_t drops_[static_cast<size_t>(DropReason::Count)] = {};
 };
 
 }  // namespace monitour::capture

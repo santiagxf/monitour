@@ -79,23 +79,40 @@ static int wmain_inner() {
     cfg.preferredFps = settings.activeFps;
     capture::MfCaptureSession capture{d3d, slot, cfg};
 
-    // --- Inference ---
-    // Resolve the model path here, but DO NOT construct the model on this
-    // thread: wWinMain initialises an STA, and WinML's
-    // LoadFromStorageFileAsync().get() deadlocks when blocked on an STA. The
-    // HeadPoseModel is built on the inference worker thread (MTA) below.
-    auto selection = inference::selectDevice(inference::DeviceChoice::Auto);
-    auto modelPath = inference::modelPathFor(selection,
-                                             std::filesystem::current_path());
+    // --- Inference paths ---
+    // CMake POST_BUILD copies models and the compiled shader next to the exe,
+    // so the exe directory is the source of truth at runtime. The
+    // repo-relative fallback lets a dev run from the source tree without
+    // copying models around.
+    std::filesystem::path exeDir;
+    {
+        wchar_t exeBuf[MAX_PATH] = {};
+        if (GetModuleFileNameW(nullptr, exeBuf, MAX_PATH) > 0) {
+            exeDir = std::filesystem::path{exeBuf}.parent_path();
+        }
+        if (exeDir.empty()) exeDir = std::filesystem::current_path();
+    }
+    std::filesystem::path modelDir = exeDir;
+    if (!std::filesystem::exists(modelDir / L"6drepnet.fp16.onnx")) {
+        auto repoModels = exeDir / L".." / L"models";
+        if (std::filesystem::exists(repoModels / L"6drepnet.fp16.onnx")) {
+            modelDir = std::filesystem::weakly_canonical(repoModels);
+        }
+    }
+    const auto modelPath = inference::modelPathFor(modelDir);
     const bool modelPresent = std::filesystem::exists(modelPath);
     if (!modelPresent) {
         log::warn(L"Model file missing: {} — running without inference.",
                   modelPath.wstring());
     }
 
+    // OpenVINO NPU compile cache — survives across launches. First run pays
+    // the multi-second NPU compile; subsequent runs hit the cache.
+    const auto cacheDir = dataDir / L"ov_cache";
+
     d3d::Nv12ToTensor preprocessor{
         d3d,
-        std::filesystem::current_path() / L"Nv12ToTensor.cso",
+        exeDir / L"Nv12ToTensor.cso",
         kModelInputSize,
     };
 
@@ -157,33 +174,41 @@ static int wmain_inner() {
         calibrator.seedLayout(hints);
     }
 
+#if defined(MONITOUR_DEBUG_OVERLAY)
+    // Debug-only: a small semi-transparent stats box in the top-left corner.
+    // Created hidden; the tray menu's "Show debug stats" item reveals it.
+    overlay::DebugOverlay debugOverlay;
+    overlay::DebugOverlay* overlay = &debugOverlay;
+    if (!debugOverlay.create(GetModuleHandleW(nullptr))) {
+        log::warn(L"DebugOverlay::create failed; continuing without overlay.");
+        overlay = nullptr;
+    }
+#endif
+
     // --- Tray + hotkey ---
     tray::TrayIcon tray;
-    tray.create(GetModuleHandleW(nullptr), {
+    tray::TrayIcon::Callbacks trayCb{
         .onTogglePause = []{
             bool was = g_paused.exchange(!g_paused.load());
             log::info(L"Pause toggled: {} -> {}", was, !was);
         },
         .onQuit = []{ g_quit.store(true); PostQuitMessage(0); },
         .isPaused = []{ return g_paused.load(); },
-    });
+    };
+#if defined(MONITOUR_DEBUG_OVERLAY)
+    if (overlay) {
+        trayCb.onToggleDebugStats = [overlay]{
+            overlay->setVisible(!overlay->isVisible());
+        };
+        trayCb.isDebugStatsVisible = [overlay]{ return overlay->isVisible(); };
+    }
+#endif
+    tray.create(GetModuleHandleW(nullptr), std::move(trayCb));
 
     if (!RegisterHotKey(nullptr, kHotkeyId,
                         settings.hotkeyModifiers, settings.hotkeyVk)) {
         log::warn(L"RegisterHotKey failed: {}", GetLastError());
     }
-
-#if defined(MONITOUR_DEBUG_OVERLAY)
-    // Debug-only: a small semi-transparent stats box in the top-left corner.
-    overlay::DebugOverlay debugOverlay;
-    overlay::DebugOverlay* overlay = &debugOverlay;
-    if (!debugOverlay.create(GetModuleHandleW(nullptr))) {
-        log::warn(L"DebugOverlay::create failed; continuing without overlay.");
-        overlay = nullptr;
-    } else {
-        log::info(L"Debug overlay enabled (top-left).");
-    }
-#endif
 
     // --- Worker threads ---
 
@@ -191,18 +216,38 @@ static int wmain_inner() {
     // the model, classifies, dwells, then dispatches a focus command back to
     // the main thread (via SendMessage to the tray window for serialization).
     std::thread inferThread{[&]{
-        // Run the worker as MTA so WinML's blocking async (.get()) can't
-        // deadlock — see the STA note where modelPath is resolved.
+        // MTA so any WinRT call from FaceDetector (still used for cropping)
+        // doesn't try to marshal back to the main STA.
         winrt::init_apartment(winrt::apartment_type::multi_threaded);
-        util::ScopedMmcss mmcss{L"Pro Audio"};
+        // "Capture" — not "Pro Audio". Pro Audio is reserved for sub-10ms
+        // realtime audio; using it here pegged the inference thread above the
+        // desktop compositor and the LowLevelHook timeout (~300ms), making
+        // every keystroke and mouse move freeze for the duration of an
+        // evaluate. "Capture" still tells the scheduler this is latency-
+        // sensitive without starving the rest of the system.
+        util::ScopedMmcss mmcss{L"Capture"};
 
-        // Build the head-pose model on this (MTA) thread. Loading a large ONNX
-        // graph can take a few seconds, so do it before the capture loop.
+        // Minimum interval between inference calls. 30 fps × full evaluate is
+        // overkill for human-reaction head pose, and on the GPU/DML fallback
+        // path it backpressures the desktop. ~12 Hz keeps the calibrator fed
+        // and dwell logic responsive while leaving headroom on the device.
+        constexpr auto kMinInferInterval = 80ms;
+        // Subtract the interval so the first iteration always passes the
+        // throttle. Using time_point::min() here overflows the duration
+        // arithmetic (steady_clock uses int64 nanoseconds) — the difference
+        // wraps to a tiny / negative value, the throttle check then always
+        // succeeds, and every captured frame is silently dropped.
+        auto lastInferAt = std::chrono::steady_clock::now() - kMinInferInterval;
+
+        // Build the head-pose model on this (MTA) thread. First-run NPU
+        // compile can take many seconds; the OpenVINO cache_dir we passed to
+        // makeSessionOptions makes subsequent launches near-instant.
         std::unique_ptr<inference::HeadPoseModel> model;
         if (modelPresent) {
             try {
                 model = std::make_unique<inference::HeadPoseModel>(
-                    d3d, modelPath, selection, kModelInputSize);
+                    d3d, modelPath, inference::DeviceChoice::Auto,
+                    cacheDir, kModelInputSize);
             } catch (std::exception const& e) {
                 const std::string what = e.what();
                 log::error(L"HeadPoseModel load failed: {} — running without "
@@ -266,11 +311,41 @@ static int wmain_inner() {
             return nullptr;  // making progress normally
         };
 
+        // Worker heartbeat — every 5s log how many frames we took, dropped,
+        // and how many wait-timeouts we hit. A pile of timeouts with zero
+        // taken frames means capture isn't publishing.
+        uint64_t framesTaken = 0;
+        uint64_t framesTimeout = 0;
+        uint64_t framesDroppedThrottle = 0;
+        auto lastHeartbeat = std::chrono::steady_clock::now();
+        constexpr auto kHeartbeatEvery = 5s;
+
         while (!g_quit.load(std::memory_order_acquire)) {
+            const auto hbNow = std::chrono::steady_clock::now();
+            if (hbNow - lastHeartbeat >= kHeartbeatEvery) {
+                lastHeartbeat = hbNow;
+                log::info(L"Worker heartbeat: taken={} timeouts={} "
+                          L"throttled={} (paused={})",
+                          framesTaken, framesTimeout, framesDroppedThrottle,
+                          g_paused.load() ? L"true" : L"false");
+            }
+
             capture::Frame f;
-            if (!slot.waitAndTake(f, 200ms)) continue;
+            if (!slot.waitAndTake(f, 200ms)) { ++framesTimeout; continue; }
+            ++framesTaken;
 
             if (g_paused.load(std::memory_order_acquire)) continue;
+
+            // Drop frames that arrive faster than kMinInferInterval. The
+            // FrameSlot only keeps the freshest one so dropping here is safe.
+            const auto loopNow = std::chrono::steady_clock::now();
+            if (loopNow - lastInferAt < kMinInferInterval) {
+                ++framesDroppedThrottle;
+                continue;
+            }
+            lastInferAt = loopNow;
+
+            try {
 
             // Throttled face detection: run a few times a second and cache the
             // box. Between detections, reuse the last box until it goes stale.
@@ -489,6 +564,19 @@ static int wmain_inner() {
             HWND target = mru.pickForMonitor(*classified);
             if (target) {
                 focus::ForegroundSetter::setForeground(target);
+            }
+            } catch (winrt::hresult_error const& e) {
+                // Don't let an inference / D3D / WinRT hiccup take the whole
+                // process down. The outer wmain_inner handler only catches
+                // std::exception; a bare winrt::hresult_error from the hot
+                // loop would have unwound past it and terminated silently.
+                log::warn(L"Inference loop hresult_error: 0x{:x} {}",
+                          static_cast<unsigned>(e.code().value),
+                          std::wstring{e.message()});
+            } catch (std::exception const& e) {
+                const std::string what = e.what();
+                log::warn(L"Inference loop exception: {}",
+                          std::wstring(what.begin(), what.end()));
             }
         }
     }};

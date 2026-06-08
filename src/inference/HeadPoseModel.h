@@ -1,11 +1,16 @@
 #pragma once
 #include <Windows.h>
 #include <d3d11.h>
+#include <cstdint>
 #include <filesystem>
+#include <limits>
+#include <memory>
+#include <string>
 #include <vector>
 
-#include <winrt/Windows.AI.MachineLearning.h>
 #include <winrt/base.h>
+
+#include <onnxruntime_cxx_api.h>
 
 #include "DeviceFactory.h"
 #include "HeadPose.h"
@@ -15,41 +20,45 @@ namespace monitour::capture { struct Frame; }
 
 namespace monitour::inference {
 
-// Owns the LearningModelSession + reusable binding. Evaluates a single
-// preprocessed NV12 frame and returns a HeadPose.
+// Owns an ORT Session built against the new Windows ML EP catalog. Reads the
+// preprocessed CHW fp32 tensor from a D3D11 staging buffer, evaluates the
+// model, returns a HeadPose.
 class HeadPoseModel {
 public:
     HeadPoseModel(d3d::D3DContext& d3d,
                   const std::filesystem::path& modelPath,
-                  DeviceSelection device,
+                  DeviceChoice choice,
+                  const std::filesystem::path& cacheDir,
                   UINT inputSize);
     ~HeadPoseModel();
 
     HeadPoseModel(const HeadPoseModel&) = delete;
     HeadPoseModel& operator=(const HeadPoseModel&) = delete;
 
-    // Run inference. `preprocessed` is the output buffer of Nv12ToTensor
-    // (planar CHW float16, 3*inputSize*inputSize elements).
     HeadPose evaluate(ID3D11Buffer* preprocessed);
 
     [[nodiscard]] UINT inputSize() const noexcept { return inputSize_; }
-    [[nodiscard]] const DeviceSelection& device() const noexcept { return device_; }
+    [[nodiscard]] const ResolvedDevice& device() const noexcept { return resolved_; }
 
 private:
     d3d::D3DContext& d3d_;
-    DeviceSelection  device_;
     UINT             inputSize_;
+    ResolvedDevice   resolved_;
 
-    winrt::Windows::AI::MachineLearning::LearningModel        model_{nullptr};
-    winrt::Windows::AI::MachineLearning::LearningModelSession session_{nullptr};
-    winrt::Windows::AI::MachineLearning::LearningModelBinding binding_{nullptr};
-    std::wstring inputName_;
-    std::wstring outputName_;
+    std::unique_ptr<Ort::Session> session_;
+    std::string  inputName_;
+    std::string  outputName_;
 
-    // CPU-readback staging for the preprocessed tensor + reusable float32 input
-    // (the exported ONNX graph takes tensor(float); the preprocessor emits f16).
     winrt::com_ptr<ID3D11Buffer> staging_;
     std::vector<float>           inputData_;
+
+    // Diagnostics — flushed every 50 evaluations.
+    uint64_t evalCount_{0};
+    uint64_t plausibleCount_{0};
+    float yawMin_{std::numeric_limits<float>::infinity()};
+    float yawMax_{-std::numeric_limits<float>::infinity()};
+    float pitchMin_{std::numeric_limits<float>::infinity()};
+    float pitchMax_{-std::numeric_limits<float>::infinity()};
 };
 
 }  // namespace monitour::inference
