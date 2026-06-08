@@ -26,6 +26,9 @@ public:
         // the context menu. isDebugStatsVisible reports the current state.
         std::function<void()> onToggleDebugStats;
         std::function<bool()> isDebugStatsVisible;
+        // Optional: when set, a checkable "Focus glow" item appears.
+        std::function<void()> onToggleFocusGlow;
+        std::function<bool()> isFocusGlowEnabled;
     };
 
     // Passive: still learning which monitor the user faces (yellow dot).

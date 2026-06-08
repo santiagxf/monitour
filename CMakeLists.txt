@@ -136,6 +136,7 @@ set(MONITOUR_SOURCES
     src/d3d/D3DContext.cpp
     src/d3d/Nv12ToTensor.cpp
     src/overlay/DebugOverlay.cpp
+    src/overlay/FocusGlow.cpp
     src/util/ScopedMmcss.cpp
     src/util/Logging.cpp
 )

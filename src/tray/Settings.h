@@ -15,6 +15,7 @@ struct Settings {
     UINT                      activeFps                = 60;
     UINT                      idleFps                  = 1;
     UINT                      onBatteryFps             = 15;
+    bool                      focusGlowEnabled         = true;
 };
 
 bool   load(Settings& s, const std::filesystem::path& path);

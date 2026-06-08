@@ -33,7 +33,8 @@ bool save(const Settings& s, const std::filesystem::path& path) {
       << "  \"hotkeyVk\": "            << s.hotkeyVk << ",\n"
       << "  \"activeFps\": "           << s.activeFps << ",\n"
       << "  \"idleFps\": "             << s.idleFps << ",\n"
-      << "  \"onBatteryFps\": "        << s.onBatteryFps << "\n"
+      << "  \"onBatteryFps\": "        << s.onBatteryFps << ",\n"
+      << "  \"focusGlowEnabled\": "    << (s.focusGlowEnabled ? "true" : "false") << "\n"
       << "}\n";
     return f.good();
 }

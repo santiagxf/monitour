@@ -34,6 +34,7 @@
 #include "inference/FaceDetector.h"
 #include "input/ActivityHooks.h"
 #include "overlay/DebugOverlay.h"
+#include "overlay/FocusGlow.h"
 #include "tray/Settings.h"
 #include "tray/TrayIcon.h"
 #include "util/Logging.h"
@@ -56,6 +57,7 @@ constexpr UINT kModelInputSize = 224;
 
 std::atomic<bool> g_quit{false};
 std::atomic<bool> g_paused{false};
+std::atomic<bool> g_focusGlowEnabled{true};
 
 }  // namespace
 
@@ -69,6 +71,7 @@ static int wmain_inner() {
 
     tray::Settings settings;
     tray::load(settings, dataDir / L"settings.json");
+    g_focusGlowEnabled.store(settings.focusGlowEnabled);
 
     // --- D3D + Media Foundation ---
     MFStartup(MF_VERSION);
@@ -185,6 +188,15 @@ static int wmain_inner() {
     }
 #endif
 
+    // Focus-change confirmation: brief magenta→violet glow on the border of
+    // the monitor that just received Monitour-driven focus.
+    overlay::FocusGlow focusGlow;
+    overlay::FocusGlow* glow = &focusGlow;
+    if (!focusGlow.create(GetModuleHandleW(nullptr))) {
+        log::warn(L"FocusGlow::create failed; continuing without focus glow.");
+        glow = nullptr;
+    }
+
     // --- Tray + hotkey ---
     tray::TrayIcon tray;
     tray::TrayIcon::Callbacks trayCb{
@@ -203,6 +215,15 @@ static int wmain_inner() {
         trayCb.isDebugStatsVisible = [overlay]{ return overlay->isVisible(); };
     }
 #endif
+    if (glow) {
+        trayCb.onToggleFocusGlow = [&settings]{
+            const bool now = !g_focusGlowEnabled.load();
+            g_focusGlowEnabled.store(now);
+            settings.focusGlowEnabled = now;
+            log::info(L"Focus glow toggled: {}", now ? L"on" : L"off");
+        };
+        trayCb.isFocusGlowEnabled = []{ return g_focusGlowEnabled.load(); };
+    }
     tray.create(GetModuleHandleW(nullptr), std::move(trayCb));
 
     if (!RegisterHotKey(nullptr, kHotkeyId,
@@ -258,6 +279,7 @@ static int wmain_inner() {
 
         HMONITOR lastTarget = nullptr;
         auto lastTargetSince = std::chrono::steady_clock::now();
+        HMONITOR lastFlashed = nullptr;  // suppresses re-flash on stable target
         bool wasActive = false;
         int lastPct = -1;
         uint64_t lastInputSeq = 0;
@@ -563,7 +585,12 @@ static int wmain_inner() {
 
             HWND target = mru.pickForMonitor(*classified);
             if (target) {
-                focus::ForegroundSetter::setForeground(target);
+                if (focus::ForegroundSetter::setForeground(target) &&
+                    glow && g_focusGlowEnabled.load() &&
+                    *classified != lastFlashed) {
+                    glow->flash(*classified);
+                    lastFlashed = *classified;
+                }
             }
             } catch (winrt::hresult_error const& e) {
                 // Don't let an inference / D3D / WinRT hiccup take the whole
@@ -596,6 +623,7 @@ static int wmain_inner() {
         }
         if (msg.message == WM_DISPLAYCHANGE) {
             mru.onDisplayChange();
+            focusGlow.onDisplayChange();
         }
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
@@ -610,6 +638,7 @@ static int wmain_inner() {
 #if defined(MONITOUR_DEBUG_OVERLAY)
     debugOverlay.destroy();
 #endif
+    focusGlow.destroy();
 
     UnregisterHotKey(nullptr, kHotkeyId);
     hooks.uninstall();
