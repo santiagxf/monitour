@@ -3,10 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <fstream>
-#include <functional>
 #include <limits>
-#include <sstream>
-#include <vector>
 
 #include "util/Logging.h"
 
@@ -14,26 +11,35 @@ namespace monitour::calibration {
 
 namespace {
 
-constexpr double kTwoPi = 6.283185307179586;
-constexpr double kMinVariance = 4.0;   // floor σ at 2°
+constexpr double kEpsilon = 1e-9;
+constexpr double kMinHalfExtentDeg = 3.0;   // tighter prior than this would be brittle
 
-double logPdf(double x, double mean, double variance) {
-    double v = std::max(variance, kMinVariance);
-    double d = x - mean;
-    return -0.5 * (std::log(kTwoPi * v) + (d * d) / v);
-}
-
-// Distance between two monitor means in the combined (yaw,pitch) plane. Using
-// the Euclidean distance means either axis can provide the separation:
-// side-by-side screens separate in yaw, vertically-stacked screens in pitch.
-double meanDistance(const PassiveCalibrator::Stats& a,
-                    const PassiveCalibrator::Stats& b) {
-    const double dy = a.yawMean - b.yawMean;
-    const double dp = a.pitchMean - b.pitchMean;
-    return std::sqrt(dy * dy + dp * dp);
+int cellIndex(double deg, double minDeg, double cellDeg, int cells) {
+    int idx = static_cast<int>(std::floor((deg - minDeg) / cellDeg));
+    if (idx < 0) idx = 0;
+    if (idx >= cells) idx = cells - 1;
+    return idx;
 }
 
 }  // namespace
+
+int PassiveCalibrator::yawCells() const noexcept {
+    return std::max(
+        1,
+        static_cast<int>(std::lround((cfg_.yawMaxDeg - cfg_.yawMinDeg) / cfg_.cellDeg)));
+}
+
+int PassiveCalibrator::pitchCells() const noexcept {
+    return std::max(
+        1,
+        static_cast<int>(std::lround((cfg_.pitchMaxDeg - cfg_.pitchMinDeg) / cfg_.cellDeg)));
+}
+
+void PassiveCalibrator::ensureCells_unlocked(MonitorState& s) const {
+    const size_t n = static_cast<size_t>(yawCells()) *
+                     static_cast<size_t>(pitchCells());
+    if (s.cells.size() != n) s.cells.assign(n, 0.0);
+}
 
 bool PassiveCalibrator::recordEvidence(HMONITOR monitor, double yawDeg,
                                        double pitchDeg, double faceConfidence) {
@@ -41,61 +47,198 @@ bool PassiveCalibrator::recordEvidence(HMONITOR monitor, double yawDeg,
     if (faceConfidence < cfg_.minFaceConfidence) return false;
 
     std::lock_guard lock{mutex_};
-    auto& s = stats_[monitor];
-    if (s.n == 0) {
-        s.yawMean = yawDeg;
-        s.yawVar = 9.0;     // start with ~3° stddev once we have any data
-        s.pitchMean = pitchDeg;
-        s.pitchVar = 9.0;
-        s.n = 1;
-        return true;
+    auto& s = states_[monitor];
+    ensureCells_unlocked(s);
+
+    const int yCells = yawCells();
+    const int pCells = pitchCells();
+    const int yc = cellIndex(yawDeg, cfg_.yawMinDeg, cfg_.cellDeg, yCells);
+    const int pc = cellIndex(pitchDeg, cfg_.pitchMinDeg, cfg_.cellDeg, pCells);
+
+    // Gaussian splat in a (2r+1) × (2r+1) neighborhood around (yc, pc). The
+    // patch integrates to ~1.0 so one sample is one sample, but its weight is
+    // distributed across nearby cells — a single click no longer pins a sharp
+    // delta into one cell, which would lose to a neighboring cell on a
+    // millimetre of head jitter.
+    const int   r     = cfg_.splatRadiusCells;
+    const double sigma = std::max(cfg_.splatSigmaCells, 0.25);
+    double total = 0.0;
+    for (int dp = -r; dp <= r; ++dp) {
+        for (int dy = -r; dy <= r; ++dy) {
+            total += std::exp(-(dy * dy + dp * dp) / (2.0 * sigma * sigma));
+        }
     }
-    // EMA update for mean and variance (Welford-style with fixed α), per axis.
-    auto emaUpdate = [a = cfg_.emaAlpha](double& mean, double& var, double x) {
-        double oldMean = mean;
-        mean = (1.0 - a) * mean + a * x;
-        double dev = x - oldMean;
-        var = (1.0 - a) * var + a * (dev * dev);
-        if (var < kMinVariance) var = kMinVariance;
-    };
-    emaUpdate(s.yawMean, s.yawVar, yawDeg);
-    emaUpdate(s.pitchMean, s.pitchVar, pitchDeg);
-    s.n += 1;
+    if (total < kEpsilon) total = 1.0;
+
+    for (int dp = -r; dp <= r; ++dp) {
+        const int py = pc + dp;
+        if (py < 0 || py >= pCells) continue;
+        for (int dy = -r; dy <= r; ++dy) {
+            const int yx = yc + dy;
+            if (yx < 0 || yx >= yCells) continue;
+            const double w =
+                std::exp(-(dy * dy + dp * dp) / (2.0 * sigma * sigma)) / total;
+            s.cells[static_cast<size_t>(py) * yCells + yx] += w;
+        }
+    }
+    s.samples += 1;
     return true;
 }
 
-void PassiveCalibrator::seedLayout(const std::vector<LayoutHint>& hints) {
+void PassiveCalibrator::setLayoutPriors(const std::vector<LayoutPrior>& priors) {
     std::lock_guard lock{mutex_};
-    if (hints.empty()) return;
-
-    for (const auto& h : hints) {
-        if (!h.monitor) continue;
-
-        // Don't clobber monitors that already carry real (or loaded) evidence.
-        auto it = stats_.find(h.monitor);
-        if (it != stats_.end() && it->second.n > 1) continue;
-
-        Stats s{};
-        s.yawMean   = h.yawDeg;
-        s.pitchMean = h.pitchDeg;
-        s.yawVar    = 225.0;  // wide ~15° prior; real evidence tightens it
-        s.pitchVar  = 225.0;
-        s.n         = 1;      // single pseudo-count: a soft prior, far below minSamples
-        stats_[h.monitor] = s;
+    for (const auto& p : priors) {
+        if (!p.monitor) continue;
+        auto& s = states_[p.monitor];
+        ensureCells_unlocked(s);
+        s.prior = p;
+        s.prior.halfExtentYawDeg =
+            std::max(s.prior.halfExtentYawDeg, kMinHalfExtentDeg);
+        s.prior.halfExtentPitchDeg =
+            std::max(s.prior.halfExtentPitchDeg, kMinHalfExtentDeg);
     }
 }
 
-bool PassiveCalibrator::isMature_unlocked() const {
-    if (stats_.size() < 2) return false;
+double PassiveCalibrator::logHistAt_unlocked(const MonitorState& s,
+                                             double yawDeg,
+                                             double pitchDeg) const {
+    if (s.cells.empty() || s.samples == 0) {
+        // Uniform-ish fallback when this monitor has no real data.
+        return -std::log(static_cast<double>(yawCells() * pitchCells()));
+    }
+    const int yCells = yawCells();
+    const int pCells = pitchCells();
 
-    double closestSep = std::numeric_limits<double>::infinity();
-    for (auto a = stats_.begin(); a != stats_.end(); ++a) {
-        if (a->second.n < cfg_.minSamples) return false;
-        for (auto b = std::next(a); b != stats_.end(); ++b) {
-            closestSep = std::min(closestSep, meanDistance(a->second, b->second));
+    const double fy = (yawDeg - cfg_.yawMinDeg) / cfg_.cellDeg - 0.5;
+    const double fp = (pitchDeg - cfg_.pitchMinDeg) / cfg_.cellDeg - 0.5;
+    const int y0 = std::clamp(static_cast<int>(std::floor(fy)), 0, yCells - 1);
+    const int p0 = std::clamp(static_cast<int>(std::floor(fp)), 0, pCells - 1);
+    const int y1 = std::clamp(y0 + 1, 0, yCells - 1);
+    const int p1 = std::clamp(p0 + 1, 0, pCells - 1);
+    const double ty = std::clamp(fy - y0, 0.0, 1.0);
+    const double tp = std::clamp(fp - p0, 0.0, 1.0);
+
+    auto at = [&](int yc, int pc) {
+        return s.cells[static_cast<size_t>(pc) * yCells + yc];
+    };
+    const double v00 = at(y0, p0);
+    const double v10 = at(y1, p0);
+    const double v01 = at(y0, p1);
+    const double v11 = at(y1, p1);
+    const double v =
+        (1.0 - ty) * (1.0 - tp) * v00 + ty * (1.0 - tp) * v10 +
+        (1.0 - ty) * tp        * v01 + ty * tp        * v11;
+
+    // Add-one smoothing so a brand-new cell isn't −infinity, and normalize by
+    // total mass so the per-monitor histogram is a proper probability density
+    // (in cell units). The −log(area) term converts that to a per-degree
+    // density.
+    const double mass = static_cast<double>(s.samples);  // splats sum to ~1
+    const double smoothed = (v + 1.0 / (yCells * pCells)) / (mass + 1.0);
+    const double cellArea = cfg_.cellDeg * cfg_.cellDeg;
+    return std::log(std::max(smoothed, kEpsilon)) - std::log(cellArea);
+}
+
+double PassiveCalibrator::logPriorAt(const LayoutPrior& p,
+                                     double yawDeg, double pitchDeg) const {
+    // Independent Gaussian over yaw and pitch with σ = halfExtent / 2 (so the
+    // screen edge sits at ~2σ). Constant terms are kept so the absolute value
+    // is comparable across monitors with different extents.
+    const double sigY = std::max(p.halfExtentYawDeg, kMinHalfExtentDeg) / 2.0;
+    const double sigP = std::max(p.halfExtentPitchDeg, kMinHalfExtentDeg) / 2.0;
+    const double dy = (yawDeg - p.yawDeg) / sigY;
+    const double dp = (pitchDeg - p.pitchDeg) / sigP;
+    constexpr double kLog2Pi = 1.8378770664093453;
+    return -0.5 * (dy * dy + dp * dp) - kLog2Pi -
+           std::log(sigY) - std::log(sigP);
+}
+
+double PassiveCalibrator::priorMahalanobis(const LayoutPrior& p,
+                                           double yawDeg, double pitchDeg) const {
+    // Mahalanobis distance in the prior's own σ units (σ = halfExtent / 2).
+    // Scale-invariant: the screen edge is always at distance 2, regardless
+    // of whether the screen is a tiny laptop or a 49" ultrawide.
+    const double sigY = std::max(p.halfExtentYawDeg, kMinHalfExtentDeg) / 2.0;
+    const double sigP = std::max(p.halfExtentPitchDeg, kMinHalfExtentDeg) / 2.0;
+    const double dy = (yawDeg - p.yawDeg) / sigY;
+    const double dp = (pitchDeg - p.pitchDeg) / sigP;
+    return std::sqrt(dy * dy + dp * dp);
+}
+
+double PassiveCalibrator::scoreAt_unlocked(const MonitorState& s,
+                                           double yawDeg, double pitchDeg,
+                                           double& outLogHist,
+                                           double& outLogPrior) const {
+    outLogHist  = logHistAt_unlocked(s, yawDeg, pitchDeg);
+    outLogPrior = logPriorAt(s.prior, yawDeg, pitchDeg);
+    const double n = static_cast<double>(s.samples);
+    const double wPrior =
+        cfg_.priorAnchorSamples / (cfg_.priorAnchorSamples + n);
+    return outLogHist + wPrior * outLogPrior;
+}
+
+PassiveCalibrator::ClassifyDetail
+PassiveCalibrator::classifyDetailed(double yawDeg, double pitchDeg,
+                                    double faceConfidence) const {
+    ClassifyDetail out;
+    std::lock_guard lock{mutex_};
+    out.scores.reserve(states_.size());
+
+    double bestScore = -std::numeric_limits<double>::infinity();
+    double secondScore = -std::numeric_limits<double>::infinity();
+    double bestMaha = std::numeric_limits<double>::infinity();
+
+    for (auto& [mon, s] : states_) {
+        ClassifyDetail::PerMonitor pm{};
+        pm.monitor = mon;
+        pm.samples = s.samples;
+        pm.logScore = scoreAt_unlocked(s, yawDeg, pitchDeg,
+                                       pm.logHist, pm.logPrior);
+        out.scores.push_back(pm);
+
+        if (pm.logScore > bestScore) {
+            secondScore = bestScore;
+            out.second  = out.best;
+            bestScore = pm.logScore;
+            bestMaha  = priorMahalanobis(s.prior, yawDeg, pitchDeg);
+            out.best  = mon;
+        } else if (pm.logScore > secondScore) {
+            secondScore = pm.logScore;
+            out.second  = mon;
         }
     }
-    return closestSep >= cfg_.minMeanSeparationDeg;
+
+    // Scale-invariant outlier gate: the best monitor's (yaw, pitch) must lie
+    // within `maxPriorMahalanobis` σ of its prior. σ scales with the screen's
+    // angular footprint, so the gate is "two screens away from where the
+    // screen is" regardless of whether the screen is a laptop or an
+    // ultrawide. A raw log-density floor would reject the edges of any large
+    // screen because its constant terms grow with σ — Mahalanobis sidesteps
+    // that entirely.
+    out.committed =
+        faceConfidence >= cfg_.minFaceConfidence &&
+        states_.size() >= 2 &&
+        isMature_unlocked() &&
+        out.best != nullptr &&
+        bestMaha <= cfg_.maxPriorMahalanobis &&
+        (bestScore - secondScore) >= cfg_.ambiguityMarginNats;
+    return out;
+}
+
+std::optional<HMONITOR> PassiveCalibrator::classify(double yawDeg,
+                                                    double pitchDeg,
+                                                    double faceConfidence) const {
+    const auto d = classifyDetailed(yawDeg, pitchDeg, faceConfidence);
+    if (d.committed) return d.best;
+    return std::nullopt;
+}
+
+bool PassiveCalibrator::isMature_unlocked() const {
+    if (states_.size() < 2) return false;
+    for (auto& [mon, s] : states_) {
+        if (s.samples < cfg_.minSamples) return false;
+    }
+    return true;
 }
 
 bool PassiveCalibrator::isMature() const {
@@ -103,112 +246,94 @@ bool PassiveCalibrator::isMature() const {
     return isMature_unlocked();
 }
 
-PassiveCalibrator::MaturityProgress PassiveCalibrator::maturityProgress() const {
+double PassiveCalibrator::computeSelfAccuracy() const {
     std::lock_guard lock{mutex_};
+    return selfAccuracy_unlocked();
+}
 
-    MaturityProgress p{};
-    p.minSamples           = cfg_.minSamples;
-    p.minMeanSeparationDeg = cfg_.minMeanSeparationDeg;
-    p.monitorsSeen         = stats_.size();
-    p.mature               = isMature_unlocked();
+double PassiveCalibrator::selfAccuracy_unlocked() const {
+    // Walks every monitor's histogram cell, classifies its center under the
+    // combined score, and reports the fraction of mass that lands on its own
+    // monitor. Heavy (a few thousand score evaluations) — only callable via
+    // computeSelfAccuracy() on a slow cadence, not on the worker's hot loop.
+    if (states_.size() < 2) return 0.0;
+    const int yCells = yawCells();
+    const int pCells = pitchCells();
+    double totalMass = 0.0;
+    double correctMass = 0.0;
 
-    // Sample factor: the two best-populated monitors must each reach
-    // minSamples. Take the top-two sample counts (missing monitor counts as 0).
-    std::vector<uint64_t> counts;
-    counts.reserve(stats_.size());
-    for (auto& [mon, s] : stats_) counts.push_back(s.n);
-    std::sort(counts.begin(), counts.end(), std::greater<>{});
+    for (auto& [mon, s] : states_) {
+        if (s.cells.empty()) continue;
+        for (int p = 0; p < pCells; ++p) {
+            const double pitch =
+                cfg_.pitchMinDeg + (p + 0.5) * cfg_.cellDeg;
+            for (int y = 0; y < yCells; ++y) {
+                const double mass = s.cells[static_cast<size_t>(p) * yCells + y];
+                if (mass <= 0.0) continue;
+                const double yaw = cfg_.yawMinDeg + (y + 0.5) * cfg_.cellDeg;
 
-    auto sampleFrac = [&](size_t i) -> double {
-        const uint64_t n = i < counts.size() ? counts[i] : 0;
-        if (cfg_.minSamples == 0) return 1.0;
-        const double f = static_cast<double>(n) / static_cast<double>(cfg_.minSamples);
-        return f > 1.0 ? 1.0 : f;
-    };
-    const double sampleFactor = 0.5 * (sampleFrac(0) + sampleFrac(1));
-    p.minSampleCount = counts.size() >= 2 ? counts[1] : 0;
-
-    // Separation factor: closest pair of means vs. the required threshold.
-    double closestSep = std::numeric_limits<double>::infinity();
-    for (auto a = stats_.begin(); a != stats_.end(); ++a) {
-        for (auto b = std::next(a); b != stats_.end(); ++b) {
-            closestSep = std::min(closestSep, meanDistance(a->second, b->second));
+                double bestScore = -std::numeric_limits<double>::infinity();
+                HMONITOR bestMon = nullptr;
+                for (auto& [m2, s2] : states_) {
+                    double lh, lp;
+                    const double sc = scoreAt_unlocked(s2, yaw, pitch, lh, lp);
+                    if (sc > bestScore) { bestScore = sc; bestMon = m2; }
+                }
+                totalMass += mass;
+                if (bestMon == mon) correctMass += mass;
+            }
         }
     }
-    double sepFactor = 0.0;
-    if (stats_.size() >= 2 && std::isfinite(closestSep)) {
-        p.meanSeparationDeg = closestSep;
-        sepFactor = cfg_.minMeanSeparationDeg > 0.0
-                        ? closestSep / cfg_.minMeanSeparationDeg
-                        : 1.0;
-        if (sepFactor > 1.0) sepFactor = 1.0;
-    }
+    if (totalMass < kEpsilon) return 0.0;
+    return correctMass / totalMass;
+}
 
-    // Overall progress is multiplicative: maturity requires BOTH enough samples
-    // AND separated means, so neither gate alone should inflate the number. In
-    // particular, layout seeding pre-separates the means, so an additive form
-    // would report ~50% before any real evidence exists. Multiplying keeps the
-    // bar near 0 until real samples accumulate.
-    double overall = sampleFactor * sepFactor;
+PassiveCalibrator::MaturityProgress
+PassiveCalibrator::maturityProgress() const {
+    std::lock_guard lock{mutex_};
+    MaturityProgress p{};
+    p.minSamples   = cfg_.minSamples;
+    p.monitorsSeen = states_.size();
+    p.mature       = isMature_unlocked();
+
+    uint64_t weakest = std::numeric_limits<uint64_t>::max();
+    for (auto& [mon, s] : states_) {
+        weakest = std::min(weakest, s.samples);
+    }
+    if (weakest == std::numeric_limits<uint64_t>::max()) weakest = 0;
+    p.minSampleCount = weakest;
+
+    const double sampleFrac =
+        cfg_.minSamples == 0
+            ? 1.0
+            : std::min(1.0, static_cast<double>(weakest) /
+                                static_cast<double>(cfg_.minSamples));
+    const double monitorFrac =
+        states_.size() >= 2 ? 1.0 : 0.0;
+
+    double overall = sampleFrac * monitorFrac;
     if (p.mature) {
         overall = 1.0;
     } else if (overall > 0.999) {
-        overall = 0.999;  // not mature yet — never report a full 100%
+        overall = 0.999;
     }
     p.overall = overall;
     return p;
 }
 
-std::optional<HMONITOR> PassiveCalibrator::classify(double yawDeg,
-                                                    double pitchDeg,
-                                                    double faceConfidence) const {
-    if (faceConfidence < cfg_.minFaceConfidence) return std::nullopt;
-    std::lock_guard lock{mutex_};
-    if (!isMature_unlocked()) return std::nullopt;
-
-    HMONITOR bestMon = nullptr;
-    const Stats* bestStats = nullptr;
-    double bestLp = -std::numeric_limits<double>::infinity();
-    double secondLp = -std::numeric_limits<double>::infinity();
-
-    for (auto& [mon, s] : stats_) {
-        // Joint log-likelihood over independent yaw and pitch Gaussians.
-        double lp = logPdf(yawDeg, s.yawMean, s.yawVar) +
-                    logPdf(pitchDeg, s.pitchMean, s.pitchVar);
-        if (lp > bestLp) {
-            secondLp = bestLp;
-            bestLp = lp;
-            bestMon = mon;
-            bestStats = &s;
-        } else if (lp > secondLp) {
-            secondLp = lp;
-        }
-    }
-
-    if (!bestMon || !bestStats) return std::nullopt;
-
-    // Outlier gate (data-driven replacement for a hardcoded pitch limit): if the
-    // observation is too far from even the best monitor's learned (yaw,pitch)
-    // range, the user is looking somewhere we've never learned — the keyboard,
-    // a phone, away from every screen. Refuse rather than guess. This adapts to
-    // whatever arrangement the user actually has, including stacked monitors.
-    const double dyaw = yawDeg - bestStats->yawMean;
-    const double dpitch = pitchDeg - bestStats->pitchMean;
-    const double maha2 = (dyaw * dyaw) / std::max(bestStats->yawVar, kMinVariance) +
-                         (dpitch * dpitch) / std::max(bestStats->pitchVar, kMinVariance);
-    const double gate = cfg_.maxGatingMahalanobis * cfg_.maxGatingMahalanobis;
-    if (maha2 > gate) return std::nullopt;
-
-    if ((bestLp - secondLp) >= cfg_.ambiguityMarginNats) {
-        return bestMon;
-    }
-    return std::nullopt;
-}
-
-std::unordered_map<HMONITOR, PassiveCalibrator::Stats>
+std::unordered_map<HMONITOR, PassiveCalibrator::Snapshot>
 PassiveCalibrator::snapshot() const {
     std::lock_guard lock{mutex_};
-    return stats_;
+    std::unordered_map<HMONITOR, Snapshot> out;
+    out.reserve(states_.size());
+    for (auto& [mon, s] : states_) {
+        Snapshot snap;
+        snap.samples = s.samples;
+        snap.cells   = s.cells;
+        snap.prior   = s.prior;
+        out.emplace(mon, std::move(snap));
+    }
+    return out;
 }
 
 // --- JSON persistence (minimal, no external library) ---
@@ -217,22 +342,27 @@ bool PassiveCalibrator::save(const std::filesystem::path& path) const {
     std::lock_guard lock{mutex_};
     std::ofstream f{path};
     if (!f) return false;
-    f << "{\n  \"monitors\": [\n";
-    bool first = true;
-    for (auto& [mon, s] : stats_) {
-        if (!first) f << ",\n";
-        first = false;
-        // We persist by HMONITOR's bit pattern; on next launch the HMONITOR
-        // values may differ, so during load we re-key by device-rect identity.
-        // For now we round-trip the bit pattern as a debugging aid; the real
-        // re-key step is a TODO in load().
+    f << "{\n  \"version\": 2,\n  \"monitors\": [\n";
+    bool firstMon = true;
+    for (auto& [mon, s] : states_) {
+        if (!firstMon) f << ",\n";
+        firstMon = false;
+        // HMONITOR is unstable across launches; we still round-trip the bit
+        // pattern as a debugging aid. The real re-key step (by device-rect)
+        // remains a load() TODO.
         f << "    {\"hmon\": " << reinterpret_cast<uintptr_t>(mon)
-          << ", \"yawMean\": " << s.yawMean
-          << ", \"yawVar\": " << s.yawVar
-          << ", \"pitchMean\": " << s.pitchMean
-          << ", \"pitchVar\": " << s.pitchVar
-          << ", \"n\": " << s.n
-          << "}";
+          << ", \"samples\": " << s.samples
+          << ", \"prior\": {"
+          << "\"yaw\": " << s.prior.yawDeg
+          << ", \"pitch\": " << s.prior.pitchDeg
+          << ", \"halfExtentYaw\": " << s.prior.halfExtentYawDeg
+          << ", \"halfExtentPitch\": " << s.prior.halfExtentPitchDeg
+          << "}, \"cells\": [";
+        for (size_t i = 0; i < s.cells.size(); ++i) {
+            if (i) f << ",";
+            f << s.cells[i];
+        }
+        f << "]}";
     }
     f << "\n  ]\n}\n";
     return f.good();

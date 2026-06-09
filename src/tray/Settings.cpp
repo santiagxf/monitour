@@ -31,6 +31,8 @@ bool save(const Settings& s, const std::filesystem::path& path) {
       << "  \"suppressAfterInputMs\": "<< s.suppressAfterInput.count() << ",\n"
       << "  \"hotkeyModifiers\": "     << s.hotkeyModifiers << ",\n"
       << "  \"hotkeyVk\": "            << s.hotkeyVk << ",\n"
+      << "  \"hotkeyTeachModifiers\": "<< s.hotkeyTeachModifiers << ",\n"
+      << "  \"hotkeyTeachVk\": "       << s.hotkeyTeachVk << ",\n"
       << "  \"activeFps\": "           << s.activeFps << ",\n"
       << "  \"idleFps\": "             << s.idleFps << ",\n"
       << "  \"onBatteryFps\": "        << s.onBatteryFps << ",\n"

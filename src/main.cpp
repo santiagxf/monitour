@@ -52,12 +52,17 @@
 
 namespace {
 
-constexpr UINT kHotkeyId = 1;
+constexpr UINT kHotkeyId       = 1;
+constexpr UINT kHotkeyTeachId  = 2;
 constexpr UINT kModelInputSize = 224;
 
 std::atomic<bool> g_quit{false};
 std::atomic<bool> g_paused{false};
 std::atomic<bool> g_focusGlowEnabled{true};
+// Toggled by the teach hotkey. While true, the inference worker labels every
+// confident pose sample with the cursor's current monitor — a fast,
+// high-signal alternative to one-sample-per-click learning.
+std::atomic<bool> g_teaching{false};
 
 }  // namespace
 
@@ -129,52 +134,41 @@ static int wmain_inner() {
     calibration::PassiveCalibrator calibrator;
     calibrator.load(dataDir / L"calibration.json");
 
-    // Auto-detect the physical monitor arrangement from Windows and seed soft
-    // (yaw,pitch) priors from each screen's position: screens to the right get a
-    // positive yaw prior, screens higher up a positive pitch prior. This only
-    // seeds; it never biases classification, which stays data-driven.
+    // Auto-detect the physical monitor arrangement from Windows and install
+    // permanent geometric priors from each screen's position AND angular
+    // footprint. A wide screen close to the user gets a wide prior; a small
+    // laptop a narrow one. The prior decays in relative weight as real
+    // evidence accumulates (anchor scheme inside PassiveCalibrator), but is
+    // never erased — the wide-vs-narrow asymmetry stays informative forever.
     {
         const auto layout = focus::enumerateMonitorsLeftToRight();
+        const auto extents = focus::computeAngularExtents(layout);
         log::info(L"Detected {} monitor(s), left→right:", layout.size());
 
-        // Bounding box of monitor centers, so we can normalise each center to
-        // [-1,1] on each axis and fan the priors across ±kFanHalfDeg. With a
-        // single monitor the box is degenerate and everything maps to 0°.
-        LONG minCx = (std::numeric_limits<LONG>::max)();
-        LONG maxCx = (std::numeric_limits<LONG>::min)();
-        LONG minCy = (std::numeric_limits<LONG>::max)();
-        LONG maxCy = (std::numeric_limits<LONG>::min)();
-        for (const auto& m : layout) {
-            const LONG cx = (m.rect.left + m.rect.right) / 2;
-            const LONG cy = (m.rect.top + m.rect.bottom) / 2;
-            minCx = (std::min)(minCx, cx); maxCx = (std::max)(maxCx, cx);
-            minCy = (std::min)(minCy, cy); maxCy = (std::max)(maxCy, cy);
-        }
-        const double spanX = static_cast<double>(maxCx - minCx);
-        const double spanY = static_cast<double>(maxCy - minCy);
-        constexpr double kFanHalfDeg = 25.0;
-
-        std::vector<calibration::PassiveCalibrator::LayoutHint> hints;
-        hints.reserve(layout.size());
+        std::vector<calibration::PassiveCalibrator::LayoutPrior> priors;
+        priors.reserve(layout.size());
         for (size_t i = 0; i < layout.size(); ++i) {
             const auto& m = layout[i];
-            log::info(L"  [{}] {} [{},{} {}x{}]{}", i + 1, m.device, m.rect.left,
-                      m.rect.top, m.rect.right - m.rect.left,
-                      m.rect.bottom - m.rect.top, m.primary ? L" (primary)" : L"");
+            const auto& e = extents[i];
+            log::info(L"  [{}] {} [{},{} {}x{}]{} prior yaw={:.1f}° "
+                      L"pitch={:.1f}° hExt yaw={:.1f}° "
+                      L"pitch={:.1f}°",
+                      i + 1, m.device, m.rect.left, m.rect.top,
+                      m.rect.right - m.rect.left,
+                      m.rect.bottom - m.rect.top,
+                      m.primary ? L" (primary)" : L"",
+                      e.yawCenterDeg, e.pitchCenterDeg,
+                      e.halfExtentYawDeg, e.halfExtentPitchDeg);
 
-            const LONG cx = (m.rect.left + m.rect.right) / 2;
-            const LONG cy = (m.rect.top + m.rect.bottom) / 2;
-            // Normalise to [-1,1]; degenerate span → 0 (centered).
-            const double nx = spanX > 0.0 ? (2.0 * (cx - minCx) / spanX - 1.0) : 0.0;
-            const double ny = spanY > 0.0 ? (2.0 * (cy - minCy) / spanY - 1.0) : 0.0;
-
-            calibration::PassiveCalibrator::LayoutHint h{};
-            h.monitor  = m.handle;
-            h.yawDeg   = nx * kFanHalfDeg;   // right screen → look right → +yaw
-            h.pitchDeg = -ny * kFanHalfDeg;  // lower screen (larger y) → look down → −pitch
-            hints.push_back(h);
+            calibration::PassiveCalibrator::LayoutPrior p{};
+            p.monitor             = m.handle;
+            p.yawDeg              = e.yawCenterDeg;
+            p.pitchDeg            = e.pitchCenterDeg;
+            p.halfExtentYawDeg    = e.halfExtentYawDeg;
+            p.halfExtentPitchDeg  = e.halfExtentPitchDeg;
+            priors.push_back(p);
         }
-        calibrator.seedLayout(hints);
+        calibrator.setLayoutPriors(priors);
     }
 
 #if defined(MONITOUR_DEBUG_OVERLAY)
@@ -233,6 +227,11 @@ static int wmain_inner() {
     if (!RegisterHotKey(nullptr, kHotkeyId,
                         settings.hotkeyModifiers, settings.hotkeyVk)) {
         log::warn(L"RegisterHotKey failed: {}", GetLastError());
+    }
+    if (!RegisterHotKey(nullptr, kHotkeyTeachId,
+                        settings.hotkeyTeachModifiers,
+                        settings.hotkeyTeachVk)) {
+        log::warn(L"RegisterHotKey (teach) failed: {}", GetLastError());
     }
 
     // --- Worker threads ---
@@ -540,6 +539,21 @@ static int wmain_inner() {
                 }
             }
 
+            // --- Teach mode: every-tick labelled samples ---
+            // While the teach hotkey is on, the cursor's monitor labels every
+            // confident pose this iteration. This is the explicit
+            // "I'm looking at this screen NOW" path — much higher SNR than
+            // one sample per click, especially for screens whose normal head
+            // pose sits inside a wide adjacent screen's distribution.
+            if (g_teaching.load(std::memory_order_relaxed)) {
+                if (HMONITOR teachMon = hooks.cursorMonitor()) {
+                    ++evidenceAttempts;
+                    if (calibrator.recordEvidence(teachMon, pose.yaw, pose.pitch,
+                                                  pose.confidence))
+                        ++evidenceAccepted;
+                }
+            }
+
             // Reflect passive (learning) vs. active (calibrated) in the tray,
             // and surface convergence progress + a reason if it's stalled.
             const auto progress = calibrator.maturityProgress();
@@ -576,12 +590,10 @@ static int wmain_inner() {
                                static_cast<unsigned long long>(progress.minSamples));
                 } else {
                     swprintf_s(detail,
-                               L"%zu screens \u00b7 samples %llu/%llu \u00b7 sep %.1f\u00b0/%.0f\u00b0",
+                               L"%zu screens \u00b7 samples %llu/%llu",
                                progress.monitorsSeen,
                                static_cast<unsigned long long>(progress.minSampleCount),
-                               static_cast<unsigned long long>(progress.minSamples),
-                               progress.meanSeparationDeg,
-                               progress.minMeanSeparationDeg);
+                               static_cast<unsigned long long>(progress.minSamples));
                 }
 
                 // Re-post when either the percentage or the message changes
@@ -614,7 +626,18 @@ static int wmain_inner() {
 
 #if defined(MONITOUR_DEBUG_OVERLAY)
             // Debug-only stats box (top-left). Coalesced; safe to call hot.
-            if (overlay) {
+            // selfAccuracy walks every cell × every monitor — call it on a
+            // ~1 Hz cadence and latch the result, not per inference tick.
+            static double latchedSelfAccuracy = 0.0;
+            static auto   lastSelfAcc = std::chrono::steady_clock::now()
+                                            - std::chrono::seconds{2};
+            if (overlay && overlay->isVisible() &&
+                std::chrono::steady_clock::now() - lastSelfAcc
+                    >= std::chrono::seconds{1}) {
+                latchedSelfAccuracy = calibrator.computeSelfAccuracy();
+                lastSelfAcc = std::chrono::steady_clock::now();
+            }
+            if (overlay && overlay->isVisible()) {
                 overlay::DebugOverlay::Stats os{};
                 os.active           = active;
                 os.progressPct      = pct;
@@ -624,14 +647,34 @@ static int wmain_inner() {
                 os.screens          = progress.monitorsSeen;
                 os.sampleCount      = progress.minSampleCount;
                 os.minSamples       = progress.minSamples;
-                os.separationDeg    = progress.meanSeparationDeg;
-                os.minSeparationDeg = progress.minMeanSeparationDeg;
+                os.selfAccuracy     = latchedSelfAccuracy;
                 os.yaw              = pose.yaw;
                 os.pitch            = pose.pitch;
                 os.velocity         = velEmaDegPerSec;
                 os.confidence       = pose.confidence;
                 os.faceFound        = faceDetReady && faceValid;
                 os.reason           = reason ? reason : L"";
+                os.teaching         = g_teaching.load(std::memory_order_relaxed);
+
+                // classifyDetailed walks every monitor, so only invoke when
+                // the overlay is visible (above) — the hot loop already pays
+                // for plain classify() further down.
+                const auto detail = calibrator.classifyDetailed(
+                    pose.yaw, pose.pitch, pose.confidence);
+                os.predicted = detail.best;
+                os.committed = detail.committed ? detail.best : nullptr;
+                os.perMonitor.reserve(detail.scores.size());
+                for (const auto& pm : detail.scores) {
+                    overlay::DebugOverlay::Stats::PerMonitor opm{};
+                    opm.monitor  = pm.monitor;
+                    opm.logScore = pm.logScore;
+                    opm.samples  = pm.samples;
+                    os.perMonitor.push_back(opm);
+                }
+                std::sort(os.perMonitor.begin(), os.perMonitor.end(),
+                          [](const auto& a, const auto& b) {
+                              return a.logScore > b.logScore;
+                          });
                 overlay->update(os);
             }
 #endif
@@ -721,6 +764,16 @@ static int wmain_inner() {
             log::info(L"Hotkey pressed — paused = {}", g_paused.load());
             continue;
         }
+        if (msg.message == WM_HOTKEY && msg.wParam == kHotkeyTeachId) {
+            // Toggle the teach flag. The user clicks once on the screen they
+            // want to teach (parking the cursor), presses the hotkey, looks
+            // at the screen for a couple of seconds, then presses again to
+            // stop. At ~12 Hz inference that's ~24 labelled samples vs. one
+            // sample per click — orders of magnitude more signal.
+            const bool was = g_teaching.exchange(!g_teaching.load());
+            log::info(L"Teach hotkey: {} -> {}", was, !was);
+            continue;
+        }
         if (msg.message == WM_DISPLAYCHANGE) {
             mru.onDisplayChange();
             focusGlow.onDisplayChange();
@@ -741,6 +794,7 @@ static int wmain_inner() {
     focusGlow.destroy();
 
     UnregisterHotKey(nullptr, kHotkeyId);
+    UnregisterHotKey(nullptr, kHotkeyTeachId);
     hooks.uninstall();
     mru.stop();
     calibrator.save(dataDir / L"calibration.json");
