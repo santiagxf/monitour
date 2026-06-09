@@ -118,6 +118,19 @@ void MfCaptureSession::openSourceReader() {
 void MfCaptureSession::start() {
     if (running_.exchange(true)) return;
     log::info(L"Capture: starting");
+    // Pause fully releases the device so the webcam LED turns off — re-open
+    // it here if we were torn down (no-op on the first start after ctor).
+    if (!reader_) {
+        try {
+            openSourceReader();
+        } catch (std::exception const& e) {
+            const std::string what = e.what();
+            log::error(L"Capture: re-open failed: {}",
+                       std::wstring(what.begin(), what.end()));
+            running_.store(false);
+            return;
+        }
+    }
     if (FAILED(requestNextSample())) {
         running_.store(false);
     }
@@ -126,8 +139,16 @@ void MfCaptureSession::start() {
 void MfCaptureSession::stop() {
     if (!running_.exchange(false)) return;
     log::info(L"Capture: stopping");
+    // Flushing the reader alone keeps the underlying capture device powered
+    // (LED stays on). Release reader_ and source_ so the device closes and
+    // the LED turns off — start() will re-open on resume.
     if (reader_) {
         reader_->Flush(MF_SOURCE_READER_FIRST_VIDEO_STREAM);
+        reader_ = nullptr;
+    }
+    if (source_) {
+        source_->Shutdown();
+        source_ = nullptr;
     }
 }
 
