@@ -95,11 +95,11 @@ void DebugOverlay::update(const Stats& s) {
 std::wstring DebugOverlay::compose() const {
     // Caller holds mutex_.
     const Stats& s = stats_;
-    wchar_t buf[512];
+    wchar_t buf[1024];
     _snwprintf_s(
         buf, _countof(buf), _TRUNCATE,
         L"Monitour debug\n"
-        L"state    : %s\n"
+        L"state    : %s%s\n"
         L"progress : %d%%\n"
         L"inference: %s\n"
         L"face     : %s\n"
@@ -109,9 +109,10 @@ std::wstring DebugOverlay::compose() const {
         L"inputs   : %llu (kept %llu)\n"
         L"screens  : %zu\n"
         L"samples  : %llu / %llu\n"
-        L"separation: %.1f\u00b0 / %.0f\u00b0\n"
+        L"selfAcc  : %.0f%%\n"
         L"%s",
         s.active ? L"ACTIVE" : L"learning",
+        s.teaching ? L" [TEACHING]" : L"",
         s.progressPct,
         s.inferenceOn ? L"on" : L"OFF",
         s.faceFound ? L"detected" : L"none",
@@ -121,9 +122,55 @@ std::wstring DebugOverlay::compose() const {
         s.screens,
         static_cast<unsigned long long>(s.sampleCount),
         static_cast<unsigned long long>(s.minSamples),
-        s.separationDeg, s.minSeparationDeg,
+        s.selfAccuracy * 100.0,
         s.reason.empty() ? L"progressing" : s.reason.c_str());
-    return buf;
+    std::wstring out{buf};
+
+    // Live classifier feedback: predicted/committed line + per-monitor bar
+    // chart. The bar chart is the key UI for teaching the calibrator on an
+    // asymmetric layout \u2014 the user can see the laptop's score rise as they
+    // look at it, even when the classifier hasn't (yet) crossed the margin.
+    if (!s.perMonitor.empty()) {
+        wchar_t line[160];
+        auto labelOf = [](HMONITOR mon) -> std::wstring {
+            if (!mon) return L"\u2014";
+            MONITORINFOEXW mi{};
+            mi.cbSize = sizeof(mi);
+            if (GetMonitorInfoW(mon, &mi)) return mi.szDevice;
+            wchar_t fb[32];
+            _snwprintf_s(fb, _countof(fb), _TRUNCATE, L"%p", mon);
+            return fb;
+        };
+        _snwprintf_s(line, _countof(line), _TRUNCATE,
+                     L"\npredicted: %s\ncommitted: %s\n",
+                     labelOf(s.predicted).c_str(),
+                     labelOf(s.committed).c_str());
+        out += line;
+
+        // Normalise per-monitor scores to [0,1] for the bar chart. logScore
+        // is unbounded; min-max within the snapshot is the simplest mapping.
+        double lo = s.perMonitor.front().logScore;
+        double hi = lo;
+        for (const auto& pm : s.perMonitor) {
+            lo = (std::min)(lo, pm.logScore);
+            hi = (std::max)(hi, pm.logScore);
+        }
+        const double span = (hi - lo) > 1e-9 ? (hi - lo) : 1.0;
+        for (const auto& pm : s.perMonitor) {
+            const double t = (pm.logScore - lo) / span;
+            const int filled = static_cast<int>(t * 8.0 + 0.5);
+            wchar_t bar[10];
+            for (int i = 0; i < 8; ++i)
+                bar[i] = (i < filled) ? L'\u2588' : L'\u2591';
+            bar[8] = L'\0';
+            _snwprintf_s(line, _countof(line), _TRUNCATE,
+                         L"  [%s] %s n=%llu\n",
+                         bar, labelOf(pm.monitor).c_str(),
+                         static_cast<unsigned long long>(pm.samples));
+            out += line;
+        }
+    }
+    return out;
 }
 
 void DebugOverlay::recomposeAndResize() {

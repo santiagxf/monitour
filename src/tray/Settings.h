@@ -12,6 +12,10 @@ struct Settings {
     std::chrono::milliseconds suppressAfterInput       {1500};
     UINT                      hotkeyModifiers          = MOD_CONTROL | MOD_ALT;
     UINT                      hotkeyVk                 = 'M';
+    // Teach hotkey — while held / toggled, every confident pose sample is
+    // labelled with the cursor's current monitor. Ctrl+Alt+L by default.
+    UINT                      hotkeyTeachModifiers     = MOD_CONTROL | MOD_ALT;
+    UINT                      hotkeyTeachVk            = 'L';
     UINT                      activeFps                = 60;
     UINT                      idleFps                  = 1;
     UINT                      onBatteryFps             = 15;

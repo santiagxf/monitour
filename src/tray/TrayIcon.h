@@ -65,6 +65,9 @@ private:
     void applyStatus(Status s);
     void applyProgress(int percent);
     void updateTip();
+    // Picks the icon that should be shown right now: gray while paused,
+    // otherwise the icon for status_.
+    HICON currentIcon() const;
 
     HWND       hwnd_{nullptr};
     NOTIFYICONDATAW nid_{};

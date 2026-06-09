@@ -106,8 +106,9 @@ bool TrayIcon::create(HINSTANCE hInstance, Callbacks cb) {
     nid_.uCallbackMessage = WM_TRAYICON;
     iconPassive_ = makeDotIcon(240, 200, 0);    // yellow: learning
     iconActive_  = makeDotIcon(40, 200, 80);     // green: active
-    iconAbsent_  = makeDotIcon(150, 150, 150);   // gray: face not detected
-    nid_.hIcon  = iconPassive_ ? iconPassive_ : LoadIconW(nullptr, IDI_APPLICATION);
+    iconAbsent_  = makeDotIcon(150, 150, 150);   // gray: face not detected / paused
+    HICON initial = currentIcon();
+    nid_.hIcon  = initial ? initial : LoadIconW(nullptr, IDI_APPLICATION);
     updateTip();
     Shell_NotifyIconW(NIM_ADD, &nid_);
     return true;
@@ -122,6 +123,18 @@ void TrayIcon::destroy() {
     if (iconPassive_) { DestroyIcon(iconPassive_); iconPassive_ = nullptr; }
     if (iconActive_)  { DestroyIcon(iconActive_);  iconActive_  = nullptr; }
     if (iconAbsent_)  { DestroyIcon(iconAbsent_);  iconAbsent_  = nullptr; }
+}
+
+HICON TrayIcon::currentIcon() const {
+    // Paused takes precedence over status_: the icon should read "off" until
+    // the user resumes, no matter what the worker last reported.
+    if (cb_.isPaused && cb_.isPaused()) return iconAbsent_;
+    switch (status_) {
+        case Status::Active:  return iconActive_;
+        case Status::Absent:  return iconAbsent_;
+        case Status::Passive: return iconPassive_;
+    }
+    return iconPassive_;
 }
 
 void TrayIcon::updateTip() {
@@ -156,6 +169,9 @@ void TrayIcon::updateTip() {
 
 void TrayIcon::refresh() {
     if (!hwnd_) return;
+    // Pause toggles enter through here, so re-resolve the icon — without this
+    // the dot keeps its prior color and never goes gray on pause.
+    if (HICON icon = currentIcon()) nid_.hIcon = icon;
     updateTip();
     Shell_NotifyIconW(NIM_MODIFY, &nid_);
 }
@@ -186,10 +202,9 @@ void TrayIcon::applyStatus(Status s) {
     if (!hwnd_) return;
     const bool becameActive = (s == Status::Active && status_ != Status::Active);
     status_ = s;
-    HICON icon = (s == Status::Active) ? iconActive_
-               : (s == Status::Absent) ? iconAbsent_
-                                       : iconPassive_;
-    if (icon) nid_.hIcon = icon;
+    // Route through currentIcon() so a Passive/Active update from the worker
+    // while paused doesn't clobber the gray paused icon.
+    if (HICON icon = currentIcon()) nid_.hIcon = icon;
     updateTip();
     Shell_NotifyIconW(NIM_MODIFY, &nid_);
     if (becameActive) {

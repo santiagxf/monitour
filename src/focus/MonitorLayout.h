@@ -19,4 +19,22 @@ struct MonitorInfo {
 // source for "where each screen sits" — no manual configuration needed.
 std::vector<MonitorInfo> enumerateMonitorsLeftToRight();
 
+// Geometric angular footprint of one monitor as seen from the user's eye.
+// Computed from the monitor's pixel rect and an assumed Windows DPI of 96
+// (pixels-per-inch fallback) together with an assumed viewing distance in cm.
+// "halfExtent" is the half-angle from the screen center to either edge.
+struct AngularExtent {
+    double yawCenterDeg{0.0};
+    double pitchCenterDeg{0.0};
+    double halfExtentYawDeg{15.0};
+    double halfExtentPitchDeg{10.0};
+};
+
+// `layout` is the result of enumerateMonitorsLeftToRight(). `viewingCm` is the
+// assumed eye-to-screen distance for the user's primary working pose.
+// Returns one AngularExtent per monitor in the same order as `layout`.
+std::vector<AngularExtent>
+computeAngularExtents(const std::vector<MonitorInfo>& layout,
+                      double viewingCm = 60.0);
+
 }  // namespace monitour::focus

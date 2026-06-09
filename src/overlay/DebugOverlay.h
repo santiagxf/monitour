@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace monitour::overlay {
 
@@ -26,14 +27,28 @@ public:
         size_t   screens{0};
         uint64_t sampleCount{0};
         uint64_t minSamples{0};
-        double   separationDeg{0.0};
-        double   minSeparationDeg{0.0};
+        double   selfAccuracy{0.0};       // 0..1, replaces Gaussian-era separation
         double   yaw{0.0};
         double   pitch{0.0};
         double   velocity{0.0};
         double   confidence{0.0};
         bool     faceFound{false};
         std::wstring reason;   // empty → progressing normally
+        bool     teaching{false};
+        // Live classifier feedback. predicted is the argmax monitor
+        // regardless of margin/dwell; committed is the monitor focus would
+        // actually switch to (null until classify() commits).
+        HMONITOR predicted{nullptr};
+        HMONITOR committed{nullptr};
+        // Per-monitor scores ordered by descending logScore. Used to draw a
+        // small bar chart so the user sees the laptop's bar growing even
+        // when the classifier isn't (yet) committing to switch focus.
+        struct PerMonitor {
+            HMONITOR monitor{nullptr};
+            double   logScore{0.0};
+            uint64_t samples{0};
+        };
+        std::vector<PerMonitor> perMonitor;
     };
 
     DebugOverlay() = default;

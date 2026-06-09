@@ -37,6 +37,13 @@ public:
     std::optional<RECT> detect(d3d::D3DContext& d3d, ID3D11Texture2D* nv12,
                                UINT subresource);
 
+    // Bumps the UnstableBox counter so the next periodic FaceDetect log line
+    // reflects detections rejected by the caller's stability check (the box
+    // grew, shifted, or skewed in a way that looks like a hand intruding on
+    // the face crop). Decision lives in the caller; counter lives here so all
+    // outcome diagnostics surface through the same log line.
+    void noteUnstableBox() noexcept;
+
 private:
     // Per-attempt outcomes — counters surface in the periodic FaceDetect log.
     enum class Outcome {
@@ -49,6 +56,7 @@ private:
         NoDetector,
         NullTexture,
         ZeroSizeFrame,
+        UnstableBox,
         Count
     };
     void maybeFlushDiagnostics();

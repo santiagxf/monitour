@@ -179,20 +179,26 @@ std::optional<RECT> FaceDetector::detect(d3d::D3DContext& d3d,
     }
 }
 
+void FaceDetector::noteUnstableBox() noexcept {
+    ++outcomes_[static_cast<size_t>(Outcome::UnstableBox)];
+}
+
 void FaceDetector::maybeFlushDiagnostics() {
     constexpr uint64_t kFlushEvery = 50;  // ~12s at 4Hz idle cadence
     if (attempts_ % kFlushEvery != 0) return;
 
-    const uint64_t success = outcomes_[static_cast<size_t>(Outcome::Success)];
-    const uint64_t noFace  = outcomes_[static_cast<size_t>(Outcome::NoFaceFound)];
-    const uint64_t threw   = outcomes_[static_cast<size_t>(Outcome::DetectThrew)];
-    const uint64_t mapFail = outcomes_[static_cast<size_t>(Outcome::MapFailed)];
+    const uint64_t success  = outcomes_[static_cast<size_t>(Outcome::Success)];
+    const uint64_t noFace   = outcomes_[static_cast<size_t>(Outcome::NoFaceFound)];
+    const uint64_t threw    = outcomes_[static_cast<size_t>(Outcome::DetectThrew)];
+    const uint64_t mapFail  = outcomes_[static_cast<size_t>(Outcome::MapFailed)];
+    const uint64_t unstable = outcomes_[static_cast<size_t>(Outcome::UnstableBox)];
     const uint32_t lumaMean =
         lumaSamples_ ? static_cast<uint32_t>(lumaMeanSum_ / lumaSamples_) : 0;
 
     log::info(L"FaceDetect: {} attempts — success={} noFace={} threw={} "
-              L"mapFail={} | luma min/mean/max={}/{}/{} | candidates/attempt={:.2f}",
-              attempts_, success, noFace, threw, mapFail,
+              L"mapFail={} unstable={} | luma min/mean/max={}/{}/{} | "
+              L"candidates/attempt={:.2f}",
+              attempts_, success, noFace, threw, mapFail, unstable,
               static_cast<uint32_t>(lumaMin_), lumaMean,
               static_cast<uint32_t>(lumaMax_),
               attempts_ ? static_cast<double>(faceCandidates_) / attempts_ : 0.0);
